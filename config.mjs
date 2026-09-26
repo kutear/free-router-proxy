@@ -382,6 +382,69 @@ const OVERLAY_MIGRATIONS = [
   // first version needs no structural backfill.
 ];
 
+const PROVIDER_ID_RE = /^[a-z][a-z0-9_-]*$/;
+
+// Route entries used to be bare OpenRouter ids (`poolside/laguna-s-2.1:free`).
+// Discovery, the web UI, and older overlays still emit that form. Canonical
+// storage is always `{ provider, model }`; a `provider:` prefix wins when the
+// prefix is a known provider id, otherwise the string belongs to defaultProvider.
+export function canonicalizeRouteEntry(entry, defaultProvider = 'openrouter', knownProviders = null) {
+  const fallback = String(defaultProvider || 'openrouter');
+  if (entry && typeof entry === 'object' && !Array.isArray(entry)) {
+    const provider = String(entry.provider || fallback).trim() || fallback;
+    const model = String(entry.model || entry.id || '').trim();
+    return model ? { provider, model } : null;
+  }
+  const text = String(entry || '').trim();
+  if (!text) return null;
+  const separator = text.indexOf(':');
+  if (separator > 0) {
+    const prefix = text.slice(0, separator);
+    const model = text.slice(separator + 1).trim();
+    const known = !knownProviders || knownProviders.has(prefix);
+    if (PROVIDER_ID_RE.test(prefix) && known) {
+      return model ? { provider: prefix, model } : null;
+    }
+  }
+  return { provider: fallback, model: text };
+}
+
+function canonicalizeRouteList(entries, defaultProvider, knownProviders) {
+  if (!Array.isArray(entries)) return { list: entries, changed: false };
+  let changed = false;
+  const list = [];
+  for (const entry of entries) {
+    const canonical = canonicalizeRouteEntry(entry, defaultProvider, knownProviders);
+    if (!canonical) {
+      changed = true;
+      continue;
+    }
+    if (
+      typeof entry !== 'object' ||
+      Array.isArray(entry) ||
+      String(entry.provider || '') !== canonical.provider ||
+      String(entry.model || entry.id || '') !== canonical.model
+    ) {
+      changed = true;
+    }
+    list.push(canonical);
+  }
+  return { list, changed };
+}
+
+export function canonicalizeOverlayRoutes(overlay) {
+  if (!isPlainObject(overlay) || !isPlainObject(overlay.routes)) return false;
+  const defaultProvider = String(overlay.defaultProvider || 'openrouter');
+  let changed = false;
+  for (const [name, entries] of Object.entries(overlay.routes)) {
+    const { list, changed: routeChanged } = canonicalizeRouteList(entries, defaultProvider, null);
+    if (!routeChanged) continue;
+    overlay.routes[name] = list;
+    changed = true;
+  }
+  return changed;
+}
+
 export function runOverlayMigrations(overlay) {
   if (!isPlainObject(overlay)) return false;
   let changed = false;
@@ -392,6 +455,11 @@ export function runOverlayMigrations(overlay) {
   }
   if (current !== SCHEMA_VERSION) {
     overlay._schemaVersion = SCHEMA_VERSION;
+    changed = true;
+  }
+  if (canonicalizeOverlayRoutes(overlay)) changed = true;
+  if (isPlainObject(overlay.discovery) && Object.prototype.hasOwnProperty.call(overlay.discovery, 'provider')) {
+    delete overlay.discovery.provider;
     changed = true;
   }
   return changed;
@@ -439,6 +507,15 @@ export function buildLiveConfig(base, overlay) {
   if (Array.isArray(removedProviders) && isPlainObject(merged.providers)) {
     for (const name of removedProviders) delete merged.providers[String(name)];
   }
+  if (isPlainObject(merged.routes)) {
+    const defaultProvider = String(merged.defaultProvider || 'openrouter');
+    const known = new Set(Object.keys(merged.providers || {}));
+    if (defaultProvider) known.add(defaultProvider);
+    for (const [name, entries] of Object.entries(merged.routes)) {
+      const { list, changed } = canonicalizeRouteList(entries, defaultProvider, known);
+      if (changed) merged.routes[name] = list;
+    }
+  }
   return merged;
 }
 
@@ -468,7 +545,7 @@ export function defaultConfigObject() {
         modelsUrl: 'https://generativelanguage.googleapis.com/v1beta/models',
         modelsKeyHeader: 'x-goog-api-key',
         keyEnv: 'GEMINI_API_KEY',
-        freeModels: ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite'],
+        freeModels: [],
         keys: [],
       },
       openrouter: {
@@ -485,22 +562,34 @@ export function defaultConfigObject() {
       tokenrouter: {
         catalog: true,
         pricing: false,
+        probeFreeTier: true,
         baseUrl: 'https://api.tokenrouter.com/v1',
         keyEnv: 'TOKENROUTER_API_KEY',
-        freeModels: ['z-ai/glm-5.3-free'],
+        freeModels: [],
         keys: [],
       },
       bai: {
+        catalog: true,
+        pricing: false,
+        probeFreeTier: true,
         baseUrl: 'https://api.b.ai/v1',
         keyEnv: 'BAI_API_KEY',
-        freeModels: ['glm-5.3-flash', 'deepseek-v4-flash', 'qwen3.8-flash', 'hy3', 'mimo-v2.5'],
+        freeModels: [],
+        keys: [],
+      },
+      hashneuron: {
+        catalog: true,
+        pricing: false,
+        probeFreeTier: true,
+        baseUrl: 'https://hashneuron.space/v1',
+        keyEnv: 'HASHNEURON_API_KEY',
+        freeModels: [],
         keys: [],
       },
     },
     discovery: {
       enabled: true,
-      provider: 'openrouter',
-      intervalMs: 172800000,
+      intervalMs: 7200000,
       route: 'free-best',
       stateFile: 'discovered-free-models.json',
       exclude: {
@@ -525,14 +614,7 @@ export function defaultConfigObject() {
         enabled: true,
         maxTokens: 4000,
         maxPerRun: 8,
-        usageWeight: 12,
-        usageMinRequests: 20,
-        pinnedModels: [
-          'gemini:gemini-3.8-flash',
-          'gemini:gemini-3.7-flash',
-          'tokenrouter:z-ai/glm-5.3-free',
-          'bai:glm-5.3-flash',
-        ],
+        pinnedModels: [],
       },
     },
     usage: {
@@ -554,20 +636,7 @@ export function defaultConfigObject() {
       forbidden: 3600000,
     },
     routes: {
-      'free-best': [
-        { provider: 'gemini', model: 'gemini-3.8-flash' },
-        { provider: 'gemini', model: 'gemini-3.7-flash' },
-        { provider: 'tokenrouter', model: 'z-ai/glm-5.3-free' },
-        { provider: 'bai', model: 'glm-5.3-flash' },
-        { provider: 'gemini', model: 'gemini-3.5-flash-lite' },
-        { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
-        { provider: 'bai', model: 'deepseek-v4-flash' },
-        'stealth/ox-alpha',
-        'z-ai/glm-5.2:free',
-        { provider: 'bai', model: 'qwen3.8-flash' },
-        { provider: 'bai', model: 'hy3' },
-        { provider: 'bai', model: 'mimo-v2.5' },
-      ],
+      'free-best': [],
     },
     webui: { enabled: true, envFile: '.env' },
   };

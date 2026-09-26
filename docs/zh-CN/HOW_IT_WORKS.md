@@ -29,6 +29,7 @@ cp .env.example .env
 | `OPENROUTER_API_KEY` | 是，OpenRouter 兜底和模型发现都要它 | [openrouter.ai/keys](https://openrouter.ai/keys) |
 | `TOKENROUTER_API_KEY` | 否 | 你的 TokenRouter 账号 |
 | `BAI_API_KEY` | 否 | [chat.b.ai](https://chat.b.ai) API Key，一个 Key 通所有 B.AI 官方模型 |
+| `HASHNEURON_API_KEY` | 否 | HashNeuron OpenAI 兼容网关 `https://hashneuron.space/v1` |
 | `GEMINI_API_KEY` | 否 | [Google AI Studio](https://aistudio.google.com/apikey)。免费层 Flash-Lite 是限配额的，不是无限的 |
 
 之后加的 provider 叫 `foo`，默认读 `FOO_API_KEY` 和 `FOO_BASE_URL`，除非
@@ -256,8 +257,8 @@ OpenAI 兼容的 `/chat/completions` 端口加进来不用改代码。`providers
 
 1. 加一个 provider 对象。有 `GET /models` 就 `"catalog": true`；返回体
    带逐 token 价格才加 `"pricing": true`，否则 `freeModels` 当白名单（见下）。
-2. 把 `{ "provider": "<name>", "model": "<id>" }` 插进 `routes.free-best`
-   想排的位置。裸字符串归 `defaultProvider`。
+2. 可选：只有要手动排名时才把 `{ "provider": "<name>", "model": "<id>" }`
+   插进 `routes.free-best`。发现会自己填排名。裸字符串归 `defaultProvider`。
 3. 可选：`discovery.evaluation.pinnedModels` 里 `name:model` 置顶。
 4. `.env` 或 `~/.hermes/.env` 里设 `<NAME>_API_KEY`；URL 不一样用
    `<NAME>_BASE_URL` 覆盖。
@@ -291,11 +292,12 @@ OpenAI 兼容的 `/chat/completions` 端口加进来不用改代码。`providers
 | `static+catalog` | `catalog: true, pricing: false` | `freeModels`，外加实际能免费服务的 | 只管减；`probeFreeTier` 开了也能加 |
 | `static` | 都不设 | `freeModels` | 无 |
 
-只有 OpenRouter 公布价格，所以只有它能光看目录加新模型。Gemini 和
-TokenRouter 的 `/models` 没有 `pricing` 字段，免费收费混在一起，按列表
-自动加可能把流量引到计费模型上。但它们的目录照样拉，有两个用：掉线
-了的 `freeModels` 条目会被拿掉，以及给探活（下面）提供候选。下架的模型
-一回来就自动恢复。
+只有 OpenRouter 公布价格，所以只有它能光看目录 `$0` 加新模型。Gemini、
+TokenRouter、B.AI、HashNeuron 没有价格。开了 `probeFreeTier` 照样能贡献：
+OpenAI 兼容目录走和 OpenRouter 一样的极小现场探测；Gemini 原生列表走
+配额形 429 的评测探测。默认 `routes.free-best`、`freeModels`、
+`pinnedModels` 都是空的，排名里只有发现留下来的模型。已经判定免费的
+目录条目仍会收进排名，所以清空配置不会丢掉证过的模型。
 
 目录拉失败、返回空、或者渠道没 Key，都不改变现状：`freeModels` 照旧
 说了算。删条目必须看到一份**真正拉到的**目录，上游一抖不会清空路由。
@@ -308,29 +310,31 @@ TokenRouter 的 `/models` 没有 `pricing` 字段，免费收费混在一起，�
 
 ## 免费模型发现
 
-路由器每 `discovery.intervalMs`（当前每 2 天）扫一遍开了 `discover` 的
-目录渠道，看有没有新的免费文本模型。每个新模型得一次缓存的混合评测：
-确定性推理/指令题、延迟、上下文长度、工具和结构化输出支持，分数决定
-它插进 `free-best` 的位置。
+路由器每 `discovery.intervalMs`（当前每 2 天）扫一遍**能加模型**的目录
+渠道（`pricing: true` 或 `probeFreeTier: true`），看有没有新的免费文本
+模型。目录标价 `$0` 不等于能打：剩下的
+聊天 id 再发一次极小补全（`hi`，`max_tokens: 4`，12 秒超时，每批 8 个）。
+只保留 HTTP 200 且响应里没有扣费字段的模型。若探测全部超时或连不上，
+保留上一份名单，不清空。探测失败会记下“不免费”，配置里写了也会跳过。
+探测请求不计用量。
 
-分数三部分封顶，单项带不动全局：
+排名用 `swe-bench.json` 里公布的 SWE-bench Verified 百分比（从
+[humantonylee/free-router](https://github.com/humantonylee/free-router)
+抄的 Artificial Analysis 数字，另补了那份表对不上当前免费名单的模型（Gemini 3.x Flash、Qwen3.8-27B、
+Nemotron Ultra/Lightning 等），来自 Vals 托管的 SWE-bench；不是 SWE-bench 官方 dump）。匹配方式跟那份
+目录一样：精确 id、派生 slug，再前缀匹配拼写变体（`glm-5.2` → `glm5`）。
+延迟、用量、目录元数据、本地测验都不进排名。请求时照样会切到下一台能打
+通的模型。
 
-| 部分 | 上限 | 说明 |
-|---|---|---|
-| benchmark | 65 | 10 道确定性题，最难 3 道占 28 分 |
-| metadata | 20 | 工具、结构化输出、上下文长度、模态、新鲜度 |
-| latency | 6 | 一次冷采样，故意只做小权重平局裁决 |
+表里没有的模型仍留在路由里，排在有 SWE 分的后面，分数 `-1`、来源
+`unranked`。置顶仍然最前。路由里保存了条目时，按保存顺序先于其余发现
+的模型。`evaluation.baselineScores` 仍可手改覆盖。
+本地 10 题测验还是会记在 `discovery.evaluations` 里当诊断，但不决定
+`free-best` 顺序。
 
-分数缺失、还是 `pending`、或是老 benchmark 版本产的，都会重评。不然
-单次评测撞上 429 的模型会永远背着 `-1` 的 fallback 分垫底——它已经在
-跟踪名单里，再也不会被当新模型看。每轮最多评 `evaluation.maxPerRun` 个。
-
-排名还会跟着真实流量走。单个模型在用量窗口攒够
-`evaluation.usageMinRequests` 次尝试后，成功率按
-`evaluation.usageWeight` 上下调分：100% 加满，80% 不动，60% 及以下扣
-满。置顶模型豁免。同一模型多家提供时按最好的一家排名，一家拉胯不连累
-模型。`./models.sh` 的 `rank+-` 列看当前偏移，`/health` 里每条有
-`baseScore` 和 `scoreAdjustment`。
+`./models.sh` 的 `SWE` 列是这个百分比。`/health` 每条有 `score`、
+`baseScore`、`scoreSource`（`swe-bench` / `unranked` / `baseline` /
+`pinned`）。
 
 ### 问渠道什么免费
 
@@ -339,7 +343,7 @@ TokenRouter 的 `/models` 没有 `pricing` 字段，免费收费混在一起，�
 
 | 回复 | 含义 | 效果 |
 |---|---|---|
-| `200` | 这把 Key 能 serve | 免费；带评测分进路由 |
+| `200` | 这把 Key 能 serve | 免费；留在路由 |
 | `429`，免费配额全 `limit: 0` | 根本没有免费档 | 移出路由 |
 | `429`，有 `limit` 大于 `0` | 免费，但今天花完了 | 留下；数字变每日限额 |
 | `404` | 不接，或下架了 | 移出路由 |
@@ -391,11 +395,11 @@ provider 让等的 `retryDelay`。
 集。`/health` 在 `discovery.excludedModels` 里列当前命中。
 
 `evaluation.baselineScores` 直接覆盖分数，按 `provider:model` 或裸模型
-ID 找。发现的和配置的都管，优先于评测分，适合埋掉那些自动打分虚高的
-模型。
+ID 找。发现的和配置的都管，优先于 SWE 查找表。
 
-catalog 模型变付费、下架、不再符合文本聊天，下一轮目录检查自动移出所
-有效路由。它留在 `config.json` 里当排名历史，目录哪天又标免费就恢复。
+catalog 模型变付费、下架、不再符合文本聊天、或现场探测打不通，下一轮
+目录检查自动移出有效路由。它留在 `config.json` 里当排名历史，下次探测
+成功才恢复。
 
 `static` 渠道的候选，有 `freeModels` 又有 Key 就一直在；`static+catalog`
 的还得出现在拉到的目录里，不在的进 `discovery.unavailableModels` 报备。
@@ -408,7 +412,6 @@ gitignored 的。
 ```json
 "discovery": {
   "enabled": true,
-  "provider": "openrouter",
   "intervalMs": 172800000,
   "route": "free-best",
   "stateFile": "discovered-free-models.json",
@@ -422,22 +425,19 @@ gitignored 的。
     "enabled": true,
     "maxTokens": 4000,
     "maxPerRun": 8,
-    "usageWeight": 12,
-    "usageMinRequests": 20,
-    "pinnedModels": [
-      "gemini:gemini-3.8-flash",
-      "gemini:gemini-3.7-flash",
-      "tokenrouter:z-ai/glm-5.3-free",
-      "bai:glm-5.3-flash"
-    ]
+    "pinnedModels": []
   }
 }
 ```
 
-`/health` 报上次收集时间、见过的免费模型、分数、路由优先级、以及因为
-不免费被拿掉的模型。现路由位置当 baseline 锚，从 94 起每位减 4，地板 30。
+发现写入的 id 一律是 `渠道:模型`。`/health` 的 `discovery.addsFrom` 列出
+能贡献新模型的渠道。
 
-评测请求和普通请求一样计用量，因为烧的是同一份 provider 配额。
+`/health` 报上次收集时间、见过的免费模型、SWE 分数、路由优先级、以及因为
+不免费被拿掉的模型。
+
+评测请求和普通请求一样计用量，因为烧的是同一份 provider 配额。现场探
+测那次极小补全不计用量。
 
 ## 请求历史和每日配额
 
@@ -491,17 +491,18 @@ journalctl --user -u free-router-proxy -f
 
 ## 路由行为
 
-1. `free-best` 里按**模型**排名。置顶按配置顺序打头，其余跟 baseline
-   和发现分数；同一 `provider:model` 各自成组排名。
+1. `free-best` 里按**模型**排名。置顶按配置顺序打头；路由里已保存的条目
+   按保存顺序接着排；其余发现的模型按非官方 SWE-bench Verified 百分比。
+   保存名单为空时，整表都是发现排名。同一 `provider:model` 各自成组排名。
 2. 每个模型，把当前标免费文本聊天的每家都试一遍。配置的渠道先行，
    同 slug 别家跟上。目录 ID 先剥 org 前缀和 `:free` 尾巴再比对，所以
    OpenRouter 后出的 Google/B.AI 同款免费版会紧跟原版试，而不是另起一行。
 3. 一把可用 Key 都没有的渠道跳过。
 4. catalog 渠道每 15 分钟刷新。
-5. 每 `discovery.intervalMs` 收集新免费目录文本模型、评测、按分插进
+5. 每 `discovery.intervalMs` 收集新免费目录文本模型、现场探测、按 SWE 分插进
    `free-best`。目录里撞见已在排名的模型，挂到那条下当多渠道，不当新
-   模型评。
-6. 变付费、下架、不再符合文本聊天的目录模型，移出有效路由。
+   模型。
+6. 变付费、下架、不再符合文本聊天、或免费聊天探测失败的目录模型，移出有效路由。
 7. 缺请求要的能力（工具、图片输入等）的模型去掉。
 8. 剩下按统一顺序试。
 9. 限流、超时、服务端错、空成功回复走 provider/model/Key 三级冷却；

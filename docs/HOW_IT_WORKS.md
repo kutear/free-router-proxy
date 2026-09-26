@@ -30,6 +30,7 @@ cp .env.example .env
 | `OPENROUTER_API_KEY` | Yes, for OpenRouter fallbacks and model discovery | [openrouter.ai/keys](https://openrouter.ai/keys) |
 | `TOKENROUTER_API_KEY` | No | Your TokenRouter account |
 | `BAI_API_KEY` | No | [chat.b.ai](https://chat.b.ai) API keys. One key covers all official B.AI models |
+| `HASHNEURON_API_KEY` | No | HashNeuron OpenAI-compatible gateway at `https://hashneuron.space/v1` |
 | `GEMINI_API_KEY` | No | [Google AI Studio](https://aistudio.google.com/apikey). Free-tier Flash-Lite is quota-limited, not unlimited |
 
 Any later provider named `foo` reads `FOO_API_KEY` and `FOO_BASE_URL` unless
@@ -277,8 +278,9 @@ base URL); to do it by hand:
 1. Add a provider object. Set `"catalog": true` if it exposes `GET /models`.
    Add `"pricing": true` only when that response carries per-token prices;
    otherwise keep `freeModels` as the allowlist (see below).
-2. Insert `{ "provider": "<name>", "model": "<id>" }` into `routes.free-best`
-   where you want it ranked. Bare strings belong to `defaultProvider`.
+2. Optional: insert `{ "provider": "<name>", "model": "<id>" }` into
+   `routes.free-best` only if you want a manual rank. Discovery fills the
+   route on its own. Bare strings belong to `defaultProvider`.
 3. Optionally pin `name:model` in `discovery.evaluation.pinnedModels`.
 4. Set `<NAME>_API_KEY` in `.env` or `~/.hermes/.env`, or paste the key in the
    web UI. Override the URL with `<NAME>_BASE_URL` if needed.
@@ -315,12 +317,13 @@ being able to tell free from paid are separate capabilities.
 | `static` | neither | `freeModels` | none |
 
 Only OpenRouter publishes prices, so only OpenRouter can add unknown models
-from a catalog alone. Gemini's and TokenRouter's `/models` carry no `pricing`
-field and mix free and paid models, so auto-adding from the listing could route
-traffic to a billed model. Their catalogs are still fetched for two things:
-dropping a `freeModels` entry that has disappeared upstream, and supplying
-candidates for probing (below). A withdrawn model returns automatically once
-the provider lists it again.
+from a catalog listing of `$0`. Gemini, TokenRouter, B.AI, and HashNeuron
+publish no prices. With `probeFreeTier: true` they still contribute: OpenAI-
+compatible catalogs get the same tiny live chat probe as OpenRouter; Gemini's
+native listing uses the quota-shaped evaluate probe. Default `routes.free-best`,
+`freeModels`, and `pinnedModels` lists ship empty, so the ranked route is
+whatever discovery kept. A stored `free: true` verdict still promotes that
+catalog id, so emptying the config does not drop models already proven free.
 
 A catalog that fails to load, returns nothing, or belongs to a provider with no
 key changes nothing: `freeModels` stays authoritative. Removal requires a
@@ -335,34 +338,36 @@ shows withdrawn models next to the owning provider.
 
 ## Free-model discovery
 
-The router checks each `discover`-enabled catalog provider every `discovery.intervalMs`
-(currently every 2 days) for newly free text-generation models. Each new model receives one cached hybrid evaluation
-using deterministic reasoning/instruction checks, response latency, context
-size, and tool/structured output support. Its score places it among the
-manually ranked models in `free-best`.
+The router checks every catalog provider that can add models (`pricing: true`,
+or `probeFreeTier: true`) every `discovery.intervalMs`
+(currently every 2 days) for newly free text-generation models. A priced catalog
+listing of `$0` is not enough: each remaining chat id gets a tiny live
+completion (`hi`, `max_tokens: 4`, 12s timeout, batches of 8). Only HTTP 200
+replies with no billing fields (`usage.cost` / credits) are kept. If every
+probe times out or cannot connect, the previous list is left alone instead of
+being wiped. Failed probes mark the model not-free so even a configured entry
+is skipped. Probe calls are not counted in usage.
 
-Scores are made of three parts, capped so no single part can dominate:
+Ranking uses published SWE-bench Verified percentages from `swe-bench.json`
+(unofficial copy of the Artificial Analysis numbers stored by
+[humantonylee/free-router](https://github.com/humantonylee/free-router),
+plus Gemini 3.x Flash, Qwen3.8-27B, Nemotron Ultra/Lightning, and other
+live free-route models filled from the Vals-hosted SWE-bench table that copy
+did not include).
+Matching follows that catalog: exact id, derived slug, then a prefix match
+for spelling variants such as `glm-5.2` → `glm5`. Latency, usage, catalog
+metadata, and the local puzzle are not part of the rank. Failover still
+tries the next reachable model at request time.
 
-| Part | Max | Notes |
-|---|---|---|
-| benchmark | 65 | 10 deterministic items; the 3 hardest carry 28 points |
-| metadata | 20 | tools, structured output, context length, modality, recency |
-| latency | 6 | one cold sample, so deliberately a small tiebreaker |
+Models with no SWE match stay on the route after the scored ones, in
+discovery order, with score `-1` / source `unranked`. Pins still go first.
+A non-empty saved route list is a manual order and is tried before the
+remaining discovered models. `evaluation.baselineScores` remains a numeric
+override.
 
-A model is re-evaluated when its stored score is missing, still `pending`, or
-was produced by an older benchmark version. Without this, a model whose single
-evaluation attempt hit a 429 would keep the fallback score of `-1` and stay
-last forever, because it was already tracked and so never looked like a new
-discovery again. At most `evaluation.maxPerRun` models are evaluated per run.
-
-Ranking also reacts to real traffic. Once a model has at least
-`evaluation.usageMinRequests` recorded attempts in the usage window, its
-success rate shifts its score by up to `evaluation.usageWeight` points: 100%
-success adds the full weight, 80% is neutral, 60% or worse subtracts the full
-weight. Pinned models are exempt. When one model is offered by several
-providers, the group is ranked by its best provider, so one bad provider does
-not sink the model. `./models.sh` shows the current shift in the `rank+-`
-column, and `/health` reports `baseScore` and `scoreAdjustment` per entry.
+`./models.sh` shows the SWE percentage in the `SWE` column. `/health`
+reports `score`, `baseScore`, and `scoreSource` (`swe-bench`, `unranked`,
+`baseline`, or `pinned`).
 
 ### Asking a provider what is free
 
@@ -372,7 +377,7 @@ real request and the reply is read as the answer:
 
 | Reply | Meaning | Effect |
 |---|---|---|
-| `200` | served on this key | free; enters the route with its evaluation score |
+| `200` | served on this key | free; stays on the route |
 | `429`, every free-tier `limit: 0` | no free allowance exists | dropped from routes |
 | `429`, some `limit` above `0` | free, but spent for now | kept; the number becomes its daily limit |
 | `404` | not served, or withdrawn | dropped from routes |
@@ -436,13 +441,12 @@ pattern takes effect on restart instead of after the next collection.
 
 `evaluation.baselineScores` overrides a score outright, keyed by
 `provider:model` or by the bare model ID. It applies to discovered models as
-well as configured ones, and takes precedence over the evaluation score, so it
-is the way to bury a model whose automatic score you do not trust.
+well as configured ones, and takes precedence over the SWE lookup.
 
-If a routed catalog model becomes paid, disappears, or stops qualifying as a
-text chat model, the next catalog check removes it from every effective route
-automatically. It remains in `config.json` as ranking history and becomes
-active again only if that catalog lists it as free in the future.
+If a routed catalog model becomes paid, disappears, stops qualifying as a
+text chat model, or fails the live chat probe, the next catalog check removes
+it from every effective route automatically. It remains in `config.json` as
+ranking history and becomes active again only if a later probe succeeds.
 
 Candidates from a `static` provider stay in the ranking as long as they are
 listed under `freeModels` and a key is set. On a `static+catalog` provider they
@@ -457,7 +461,6 @@ Configure the schedule and destination route in `config.json`:
 ```json
 "discovery": {
   "enabled": true,
-  "provider": "openrouter",
   "intervalMs": 172800000,
   "route": "free-best",
   "stateFile": "discovered-free-models.json",
@@ -471,25 +474,20 @@ Configure the schedule and destination route in `config.json`:
     "enabled": true,
     "maxTokens": 4000,
     "maxPerRun": 8,
-    "usageWeight": 12,
-    "usageMinRequests": 20,
-    "pinnedModels": [
-      "gemini:gemini-3.8-flash",
-      "gemini:gemini-3.7-flash",
-      "tokenrouter:z-ai/glm-5.3-free",
-      "bai:glm-5.3-flash"
-    ]
+    "pinnedModels": []
   }
 }
 ```
 
-`/health` reports the last collection time, free models seen, scores, route
-priority, and models removed because they are no longer free. Existing route
-positions act as baseline score anchors, decreasing by 4 per position from 94
-down to a floor of 30.
+Discovered ids are always `provider:model`. `/health` `discovery.addsFrom`
+lists every provider that can contribute new models.
+
+`/health` reports the last collection time, free models seen, SWE scores, route
+priority, and models removed because they are no longer free.
 
 Evaluation requests are counted in the usage statistics like any other request,
-because they consume the same provider quota.
+because they consume the same provider quota. The tiny live-reachability probes
+are not counted.
 
 ## Request history and daily quota
 
@@ -549,7 +547,9 @@ journalctl --user -u free-router-proxy -f
 ## Routing behavior
 
 1. Ranks **models** from `free-best`. Pinned models stay first, in config
-   order; the rest follow baseline rank and discovery scores.
+   order. If the route has saved entries, those come next in that order.
+   Remaining discovered models sort by unofficial SWE-bench Verified
+   percentage. An empty saved list is discovery ranking only.
 2. At each model, tries every provider that currently lists it as a free
    text-chat model. The configured provider is first; other listings for the
    same slug follow. Catalog IDs are matched after stripping an org prefix
@@ -558,10 +558,10 @@ journalctl --user -u free-router-proxy -f
    separate rank.
 3. Skips a provider when none of its API keys is usable.
 4. Refreshes catalog providers every 15 minutes.
-5. Collects newly free catalog text models every `discovery.intervalMs`, evaluates them, and inserts them
-   into `free-best` by score. A catalog listing of a model that is already
-   ranked is attached to that model instead of being evaluated as a new one.
-6. Removes catalog models that are no longer free, available, or text-chat compatible
+5. Collects newly free catalog text models every `discovery.intervalMs`, live-probes them, and inserts keepers
+   into `free-best` by SWE-bench score. A catalog listing of a model that is already
+   ranked is attached to that model instead of being treated as a new one.
+6. Removes catalog models that are no longer free, available, text-chat compatible, or reachable on a free chat probe
    from effective routes.
 7. Removes models missing capabilities required by the request, such as tools
    or image input.

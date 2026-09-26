@@ -826,9 +826,23 @@ function renderRouteEditor() {
     draftRoute = current;
     draftEntries = [...(state.editable.routes[current] || [])];
   }
+  const live = (state.allRoutes && state.allRoutes[current]) || [];
+  const liveKeys = live.map((entry) => entry.provider + ':' + entry.id);
+  const viewingLive = !draftEntries.length && liveKeys.length;
+  const rows = viewingLive ? liveKeys : draftEntries;
   const host = el('route-entries');
   host.textContent = '';
-  draftEntries.forEach((modelString, index) => {
+  if (viewingLive) {
+    const heading = document.createElement('p');
+    heading.className = 'note';
+    heading.textContent = t('route_from_discovery');
+    host.appendChild(heading);
+  }
+  const adoptLive = () => {
+    if (draftEntries.length) return;
+    draftEntries = [...liveKeys];
+  };
+  rows.forEach((modelString, index) => {
     const line = document.createElement('div');
     line.className = 'entry';
     const num = document.createElement('span');
@@ -849,13 +863,15 @@ function renderRouteEditor() {
     up.textContent = '↑';
     up.disabled = index === 0;
     up.onclick = () => {
+      adoptLive();
       draftEntries.splice(index - 1, 0, draftEntries.splice(index, 1)[0]);
       renderRouteEditor();
     };
     const down = document.createElement('button');
     down.textContent = '↓';
-    down.disabled = index === draftEntries.length - 1;
+    down.disabled = index === rows.length - 1;
     down.onclick = () => {
+      adoptLive();
       draftEntries.splice(index + 1, 0, draftEntries.splice(index, 1)[0]);
       renderRouteEditor();
     };
@@ -863,6 +879,7 @@ function renderRouteEditor() {
     rm.className = 'quiet';
     rm.textContent = '×';
     rm.onclick = () => {
+      adoptLive();
       draftEntries.splice(index, 1);
       renderRouteEditor();
     };
@@ -874,6 +891,10 @@ function renderRouteEditor() {
     line.appendChild(rm);
     host.appendChild(line);
   });
+  if (viewingLive) {
+    el('route-note').textContent = t('route_empty');
+    return;
+  }
   el('route-note').textContent = draftEntries.length ? t('route_unsaved_note') : t('route_empty');
 }
 
@@ -922,7 +943,12 @@ function bindOnce() {
   el('route-add-btn').onclick = () => {
     const value = el('route-add').value.trim();
     if (!value) return;
-    if (draftEntries.includes(value)) { toast(t('route_in_list'), 'err'); return; }
+    const live = (state.allRoutes && state.allRoutes[draftRoute]) || [];
+    const displayed = draftEntries.length
+      ? draftEntries
+      : live.map((entry) => entry.provider + ':' + entry.id);
+    if (displayed.includes(value)) { toast(t('route_in_list'), 'err'); return; }
+    if (!draftEntries.length) draftEntries = [...displayed];
     draftEntries.push(value);
     el('route-add').value = '';
     renderRouteEditor();
@@ -995,6 +1021,7 @@ function renderRoutes() {
       td(pill(status, kind)),
       td(entry.provider, 'muted'),
       td(entry.model + (entry.pinned ? '  *' : ''), 'mono'),
+      td(entry.pinned ? '*' : (Number.isFinite(entry.score) && entry.score >= 0 ? String(entry.score) : '—'), 'num'),
       td(used || '-', 'num'),
     ];
   });
@@ -1004,6 +1031,7 @@ function renderRoutes() {
       { label: t('th_status') },
       { label: t('th_provider') },
       { label: t('th_model') },
+      { label: 'SWE', num: true },
       { label: t('th_used'), num: true },
     ],
     rows,

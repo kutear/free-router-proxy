@@ -8,6 +8,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   buildLiveConfig,
+  canonicalizeRouteEntry,
   defaultConfigPath,
   ensureConfigFile,
   isPlainObject,
@@ -21,6 +22,7 @@ import {
 import {
   createProviderRegistry,
   isChatModel,
+  isMarkedFree,
   isZeroCost,
   normalizeModelSlug,
   supportsRequest,
@@ -42,6 +44,7 @@ import {
   rememberSignaturesFromPayload,
 } from './thought-signature.mjs';
 import { displayPath, maskSecret, renderPage, updateEnvFile, validateSecret } from './ui.mjs';
+import { loadSweBenchScores, sweBenchScoreFor } from './swe-bench.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(fs.readFileSync(path.join(HERE, 'package.json'), 'utf8')).version;
@@ -166,7 +169,7 @@ const registry = createProviderRegistry(config, { host: HOST, port: PORT });
 const PROVIDERS = registry.providers;
 const discoveryConfig = config.discovery || {};
 let discoveryEnabled = discoveryConfig.enabled !== false;
-const DISCOVERY_INTERVAL_MS = Number(discoveryConfig.intervalMs || 7 * 24 * 60 * 60 * 1000);
+const DISCOVERY_INTERVAL_MS = Number(discoveryConfig.intervalMs || 2 * 60 * 60 * 1000);
 const DISCOVERY_ROUTE = String(discoveryConfig.route || 'free-best');
 // How long a "not free" verdict stands before the model is worth asking again.
 const VERDICT_RETRY_MS = Number(discoveryConfig.verdictRetryMs || DISCOVERY_INTERVAL_MS);
@@ -196,9 +199,10 @@ const EVALUATION_MAX_TOKENS = Number(evaluationConfig.maxTokens || 4000);
 // older scale get recomputed instead of being compared against new ones.
 const EVALUATION_VERSION = 2;
 const EVALUATION_MAX_PER_RUN = Math.max(1, Number(evaluationConfig.maxPerRun || 8));
-const RANK_USAGE_WEIGHT = Math.max(0, Number(evaluationConfig.usageWeight ?? 12));
-const RANK_USAGE_MIN_REQUESTS = Math.max(1, Number(evaluationConfig.usageMinRequests || 20));
 const PINNED_MODELS = new Set(evaluationConfig.pinnedModels || []);
+const SWE_BENCH_SCORES = loadSweBenchScores(path.join(HERE, 'swe-bench.json'));
+const DISCOVERY_PROBE_TIMEOUT_MS = Math.max(1000, Number(discoveryConfig.probeTimeoutMs || 12000));
+const DISCOVERY_PROBE_BATCH = Math.max(1, Number(discoveryConfig.probeBatch || 8));
 const usageConfig = config.usage || {};
 const USAGE_RETENTION_DAYS = Math.max(1, Number(usageConfig.retentionDays || 7));
 const USAGE_TIMEZONE = String(usageConfig.timezone || '');
@@ -379,15 +383,17 @@ function log(message, detail = undefined) {
   else console.log(prefix, message, detail);
 }
 
+function knownProviderNames() {
+  return new Set(PROVIDERS.keys());
+}
+
 function normalizeCandidate(entry) {
-  if (typeof entry === 'string') return { provider: registry.defaultProvider, model: entry };
-  if (entry && typeof entry === 'object') {
-    return {
-      provider: String(entry.provider || registry.defaultProvider),
-      model: String(entry.model || entry.id || ''),
-    };
-  }
-  return { provider: registry.defaultProvider, model: '' };
+  return (
+    canonicalizeRouteEntry(entry, registry.defaultProvider, knownProviderNames()) || {
+      provider: registry.defaultProvider,
+      model: '',
+    }
+  );
 }
 
 function candidateKey(candidate) {
@@ -411,6 +417,7 @@ function verdictFor(key) {
   const verdict = modelVerdicts[key];
   if (!verdict) return null;
   if (verdict.free !== false) return verdict;
+  if (probeFailureIsInconclusive(verdict.reason, key)) return null;
   const age = Date.now() - Date.parse(verdict.observedAt || 0);
   return Number.isFinite(age) && age > VERDICT_RETRY_MS ? null : verdict;
 }
@@ -471,7 +478,22 @@ function learnedDailyLimit(key) {
 }
 
 function discoveredCandidate(id) {
-  return registry.parsePrefixed(id) || { provider: registry.discoveryProvider, model: id };
+  return registry.parsePrefixed(id) || { provider: registry.defaultProvider, model: id };
+}
+
+// Older state files stored OpenRouter discoveries unprefixed. A known
+// `provider:` prefix wins; anything else is assumed to be defaultProvider
+// (openrouter when that provider still exists).
+function labeledDiscoveredId(id) {
+  if (typeof id !== 'string' || !id) return '';
+  const parsed = registry.parsePrefixed(id);
+  if (parsed) return `${parsed.provider}:${parsed.model}`;
+  const fallback = PROVIDERS.has('openrouter') ? 'openrouter' : registry.defaultProvider;
+  return `${fallback}:${id}`;
+}
+
+function migrateLabeledIds(ids) {
+  return [...new Set((Array.isArray(ids) ? ids : []).map(labeledDiscoveredId).filter(Boolean))];
 }
 
 // Narrow, domain-tuned models score well on a generic benchmark but are a poor
@@ -664,21 +686,13 @@ function loadDiscoveryState() {
     usageByDay = sanitizeUsage(state.usage);
     pruneUsage();
     if (!discoveryEnabled) return;
-    discoveredModelIds = Array.isArray(state.addedModels)
-      ? state.addedModels.filter((id) => typeof id === 'string')
-      : [];
+    discoveredModelIds = migrateLabeledIds(state.addedModels);
     discoverySeenIds = Array.isArray(state.freeModels)
       ? state.freeModels.filter((id) => typeof id === 'string')
       : [];
-    discoveryRemovedIds = Array.isArray(state.removedModels)
-      ? state.removedModels.filter((id) => typeof id === 'string')
-      : [];
-    discoveryExcludedIds = Array.isArray(state.excludedModels)
-      ? state.excludedModels.filter((id) => typeof id === 'string')
-      : [];
-    discoveryUnavailableIds = Array.isArray(state.unavailableModels)
-      ? state.unavailableModels.filter((id) => typeof id === 'string')
-      : [];
+    discoveryRemovedIds = migrateLabeledIds(state.removedModels);
+    discoveryExcludedIds = migrateLabeledIds(state.excludedModels);
+    discoveryUnavailableIds = migrateLabeledIds(state.unavailableModels);
     modelVerdicts =
       state.modelVerdicts && typeof state.modelVerdicts === 'object' ? state.modelVerdicts : {};
     discoveryLastCheckedAt = Date.parse(state.lastCheckedAt || '') || 0;
@@ -750,63 +764,47 @@ function explicitScore(key) {
   return Number.isFinite(explicit) ? explicit : null;
 }
 
-function configuredScore(id, configuredIndex) {
-  const explicit = explicitScore(id);
-  if (explicit !== null) return explicit;
-  return Math.max(30, 94 - Math.max(0, configuredIndex - 1) * 4);
+function modelIdFromKey(key) {
+  return String(key).includes(':') ? key.slice(key.indexOf(':') + 1) : key;
 }
 
-// Observed reliability nudges a model up or down once it has served enough
-// traffic to be more trustworthy than a single one-shot evaluation.
-function usageAdjustment(key) {
-  if (!RANK_USAGE_WEIGHT) return 0;
-  const counts = {};
-  for (const day of usageDays()) mergeUsage(counts, usageByDay[day]?.[key]);
-  const totals = usageTotals(counts);
-  const attempts = totals.ok + totals.fail;
-  if (attempts < RANK_USAGE_MIN_REQUESTS) return 0;
-  const successRate = totals.ok / attempts;
-  const scaled = ((successRate - 0.8) / 0.2) * RANK_USAGE_WEIGHT;
-  const clamped = Math.max(-RANK_USAGE_WEIGHT, Math.min(RANK_USAGE_WEIGHT, scaled));
-  return Math.round(clamped * 10) / 10;
-}
-
-function baseModelScore(key, configured, configuredIndex) {
-  const slug = keySlug(key);
-  const modelId = key.includes(':') ? key.slice(key.indexOf(':') + 1) : key;
-  if (PINNED_MODELS.has(key) || PINNED_MODELS.has(modelId)) return Number.POSITIVE_INFINITY;
-  if (configured.has(key)) return configuredScore(key, configuredIndex.get(key));
-  for (const [configuredKey, index] of configuredIndex) {
-    if (keySlug(configuredKey) === slug) return configuredScore(configuredKey, index);
-  }
+function capabilityScore(key) {
   const explicit = explicitScore(key);
   if (explicit !== null) return explicit;
-  const evaluated = Number(modelEvaluations[modelId]?.score);
-  return Number.isFinite(evaluated) ? evaluated : -1;
+  const swe = sweBenchScoreFor(SWE_BENCH_SCORES, modelIdFromKey(key));
+  return swe !== null ? swe : -1;
 }
 
-function rankedModelScore(key, configured, configuredIndex) {
-  const base = baseModelScore(key, configured, configuredIndex);
-  if (!Number.isFinite(base) || base < 0) return base;
-  return Math.round((base + usageAdjustment(key)) * 10) / 10;
+function baseModelScore(key) {
+  const modelId = modelIdFromKey(key);
+  if (PINNED_MODELS.has(key) || PINNED_MODELS.has(modelId)) return Number.POSITIVE_INFINITY;
+  return capabilityScore(key);
+}
+
+function rankedModelScore(key) {
+  return baseModelScore(key);
 }
 
 function scoreSourceFor(key, configured) {
-  if (configured.has(key)) return 'baseline';
+  const modelId = modelIdFromKey(key);
+  if (PINNED_MODELS.has(key) || PINNED_MODELS.has(modelId)) return 'pinned';
+  if (explicitScore(key) !== null) return 'baseline';
+  if (configured?.has(key)) return 'baseline';
   const slug = keySlug(key);
-  for (const configuredKey of configured) {
-    if (keySlug(configuredKey) === slug) return 'baseline';
+  if (configured) {
+    for (const configuredKey of configured) {
+      if (keySlug(configuredKey) === slug) return 'baseline';
+    }
   }
-  return 'evaluation';
+  if (sweBenchScoreFor(SWE_BENCH_SCORES, modelId) !== null) return 'swe-bench';
+  return 'unranked';
 }
 
 function groupRank(group, configuredSet, configuredIndex) {
   let pinned = false;
   let pinIndex = Number.POSITIVE_INFINITY;
   let configuredIdx = Number.POSITIVE_INFINITY;
-  let configuredKey = '';
-  let evalScore = -1;
-  let explicit = null;
+  let score = -1;
   for (const { candidate, originalIndex } of group.members) {
     const key = candidateKey(candidate);
     if (PINNED_MODELS.has(key) || PINNED_MODELS.has(candidate.model)) {
@@ -815,33 +813,19 @@ function groupRank(group, configuredSet, configuredIndex) {
     }
     if (configuredSet.has(key) && configuredIndex.get(key) < configuredIdx) {
       configuredIdx = configuredIndex.get(key);
-      configuredKey = key;
     }
-    const override = explicitScore(key);
-    if (override !== null && (explicit === null || override > explicit)) explicit = override;
-    const evaluated = Number(modelEvaluations[candidate.model]?.score);
-    if (Number.isFinite(evaluated)) evalScore = Math.max(evalScore, evaluated);
+    score = Math.max(score, capabilityScore(key));
   }
   for (const [key, index] of configuredIndex) {
     if (keySlug(key) !== group.slug || index >= configuredIdx) continue;
     configuredIdx = index;
-    configuredKey = key;
   }
-  const base = pinned
-    ? Number.POSITIVE_INFINITY
-    : configuredIdx !== Number.POSITIVE_INFINITY
-      ? configuredScore(configuredKey, configuredIdx)
-      : explicit !== null
-        ? explicit
-        : evalScore;
-  let score = base;
-  if (!pinned && Number.isFinite(base) && base >= 0) {
-    const adjustments = group.members.map(({ candidate }) =>
-      usageAdjustment(candidateKey(candidate)),
-    );
-    score = base + (adjustments.length ? Math.max(...adjustments) : 0);
+  if (pinned) return { pinned: true, score: Number.POSITIVE_INFINITY, tie: pinIndex };
+  // A saved route order is a manual override. Keep it above any SWE %.
+  if (configuredIdx !== Number.POSITIVE_INFINITY) {
+    return { pinned: false, score: 1000 - configuredIdx, tie: group.firstIndex };
   }
-  return { pinned, score, tie: pinned ? pinIndex : group.firstIndex };
+  return { pinned: false, score, tie: group.firstIndex };
 }
 
 function orderByModelThenProvider(candidates, configuredSet, configuredIndex) {
@@ -887,6 +871,7 @@ function orderByModelThenProvider(candidates, configuredSet, configuredIndex) {
     expandedSlugs.add(group.slug);
     for (const offering of registry.offeringsForSlug(group.slug)) {
       if (candidateKeys.has(candidateKey(offering))) continue;
+      if (!candidateIsFree(offering)) continue;
       emit(offering);
     }
   }
@@ -942,6 +927,7 @@ function syncModelAvailability() {
 async function refreshCatalog(force = false) {
   await registry.refreshCatalogs(force, catalogRefreshMs, log);
   syncModelAvailability();
+  if (adoptKnownFreeCatalogModels().length) saveDiscoveryState();
 }
 
 function evaluationText(payload) {
@@ -981,7 +967,7 @@ async function evaluateModel(target) {
   const startedAt = Date.now();
   const candidate =
     typeof target === 'string'
-      ? { provider: registry.discoveryProvider, model: target }
+      ? { provider: registry.defaultProvider, model: target }
       : target;
   const model = candidateMetadata(candidate);
   const supported = new Set(model?.supported_parameters || []);
@@ -1035,9 +1021,8 @@ async function evaluateModel(target) {
     });
   }
 
-  // Weights total 65 so scores stay on the same scale as the configured
-  // baseline anchors. The last three items carry most of the discrimination;
-  // the earlier ones are saturated by every competent model.
+  // Diagnostic only. Ranking uses unofficial SWE-bench percentages, not
+  // this puzzle, catalog metadata, or a single latency sample.
   const answers = parseEvaluationAnswers(evaluationText(result.payload));
   let benchmarkScore = 0;
   if (answers) benchmarkScore += 3;
@@ -1052,8 +1037,6 @@ async function evaluateModel(target) {
   if (Number(answers?.modpow) === 49) benchmarkScore += 8;
 
   const modelMetadataScore = metadataScore(candidateMetadata(candidate));
-  // Deliberately small: this is a single cold sample and used to swing the
-  // ranking more than any capability signal did.
   const latencyScore = latencyMs <= 5000 ? 6 : latencyMs <= 15000 ? 4 : latencyMs <= 30000 ? 2 : 0;
   const score = Math.round((benchmarkScore + modelMetadataScore + latencyScore) * 10) / 10;
   return {
@@ -1068,6 +1051,320 @@ async function evaluateModel(target) {
   };
 }
 
+function responseLooksBilled(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  const usage = payload.usage;
+  if (!usage || typeof usage !== 'object') return false;
+  for (const key of ['cost', 'total_cost', 'credits', 'credit', 'total_credits']) {
+    const value = Number(usage[key]);
+    if (Number.isFinite(value) && value > 0) return true;
+  }
+  return false;
+}
+
+// Catalog price 0 is not the same as "this id will answer". routeOpen keeps
+// only models that return HTTP 200 with no billing fields on a tiny chat call.
+async function probeChatReachable(candidate) {
+  const provider = PROVIDERS.get(candidate.provider);
+  const key = registry.keySlots(candidate.provider)[0]?.key ?? provider?.apiKey;
+  if (!provider?.baseUrl || !key) {
+    return { status: 0, billed: false, ok: false, reason: 'missing key' };
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DISCOVERY_PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(registry.chatUrl(candidate.provider), {
+      method: 'POST',
+      headers: registry.headers(candidate.provider, key),
+      body: JSON.stringify({
+        model: candidate.model,
+        messages: [{ role: 'user', content: 'hi' }],
+        max_tokens: 4,
+        stream: false,
+      }),
+      signal: controller.signal,
+    });
+    let billed = false;
+    if (response.status === 200) {
+      try {
+        billed = responseLooksBilled(await response.json());
+      } catch {
+        billed = false;
+      }
+    }
+    const ok = response.status === 200 && !billed;
+    return {
+      status: response.status,
+      billed,
+      ok,
+      reason: ok ? '' : billed ? 'billed' : `HTTP ${response.status}`,
+    };
+  } catch (error) {
+    const timedOut = error?.name === 'AbortError' || /timeout/i.test(String(error));
+    return { status: 0, billed: false, ok: false, reason: timedOut ? 'timeout' : String(error) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function keepWorkingCatalogModels(ids, providerName) {
+  const kept = [];
+  const failed = [];
+  let reached = 0;
+  for (let index = 0; index < ids.length; index += DISCOVERY_PROBE_BATCH) {
+    const batch = ids.slice(index, index + DISCOVERY_PROBE_BATCH);
+    const results = await Promise.all(
+      batch.map((model) => probeChatReachable({ provider: providerName, model })),
+    );
+    for (let offset = 0; offset < batch.length; offset += 1) {
+      const result = results[offset];
+      if (result.status > 0) reached += 1;
+      if (result.ok) kept.push(batch[offset]);
+      else failed.push({ id: batch[offset], reason: result.reason });
+    }
+  }
+  return { kept, failed, reached, probed: ids.length };
+}
+
+function probeFailureIsInconclusive(reason, providerName = '') {
+  const text = String(reason || '');
+  if (/timeout/i.test(text) || /missing key/i.test(text)) return true;
+  const status = Number((text.match(/HTTP (\d+)/i) || [])[1]);
+  if (status >= 500) return true;
+  if (status !== 429) return false;
+  const name = String(providerName).includes(':')
+    ? String(providerName).slice(0, String(providerName).indexOf(':'))
+    : String(providerName);
+  // A priced catalog 429 during a probe burst is rate limiting. An unpriced
+  // 429 is often "no free tier" (B.AI / TokenRouter).
+  return Boolean(PROVIDERS.get(name)?.catalogHasPricing);
+}
+
+function shouldLiveProbeCatalog(provider) {
+  if (!provider?.usesCatalog || !registry.hasUsableKey(provider)) return false;
+  if (!provider.catalog?.size || provider.catalogError) return false;
+  if (provider.catalogHasPricing) return provider.discover !== false;
+  // Google native catalogs use quota-shaped 429s; the evaluate probe reads those.
+  return provider.probeFreeTier === true && !provider.modelsUrl;
+}
+
+function providerAddsDiscoveredModels(provider) {
+  if (!registry.hasUsableKey(provider) || !provider.catalog?.size) return false;
+  if (provider.catalogHasPricing) return provider.discover !== false;
+  if (!provider.probeFreeTier) return false;
+  // Native listings skip a re-probe on a cached verdict, so they need this
+  // promotion. Live-probed unpriced catalogs insert keepers themselves.
+  return Boolean(provider.modelsUrl);
+}
+
+function catalogVerdict(providerName, modelId) {
+  for (const key of verdictKeysFor(providerName, modelId)) {
+    const verdict = verdictFor(key);
+    if (verdict) return verdict;
+  }
+  return null;
+}
+
+function rawVerdict(providerName, modelId) {
+  for (const key of verdictKeysFor(providerName, modelId)) {
+    const verdict = modelVerdicts[key];
+    if (verdict) return verdict;
+  }
+  return null;
+}
+
+function alreadyDiscovered(providerName, modelId) {
+  const labeled = discoveredIdFor(providerName, modelId);
+  const slug = normalizeModelSlug(modelId);
+  for (const id of discoveredModelIds) {
+    if (id === labeled || id === `${providerName}:${modelId}` || id === modelId) return true;
+    const candidate = discoveredCandidate(id);
+    if (candidate.provider !== providerName) continue;
+    if (candidate.model === modelId) return true;
+    if (slug && normalizeModelSlug(candidate.model) === slug) return true;
+  }
+  return false;
+}
+
+// Config no longer seeds models. A free:true verdict from an earlier probe
+// still means the catalog entry can be routed — promote it into the discovered
+// set instead of waiting for a re-probe that the cache would skip.
+function adoptKnownFreeCatalogModels() {
+  if (!discoveryEnabled) return [];
+  const adopted = [];
+  for (const provider of PROVIDERS.values()) {
+    if (!providerAddsDiscoveredModels(provider)) continue;
+    for (const model of provider.catalog.values()) {
+      if (!model?.id || !isChatModel(model)) continue;
+      if (alreadyDiscovered(provider.name, model.id)) continue;
+      const labeled = discoveredIdFor(provider.name, model.id);
+      if (
+        discoveryExclusionReason(labeled) ||
+        discoveryExclusionReason(`${provider.name}:${model.id}`) ||
+        discoveryExclusionReason(model.id)
+      ) {
+        continue;
+      }
+      const raw = rawVerdict(provider.name, model.id);
+      if (raw?.free === false && !probeFailureIsInconclusive(raw.reason, provider.name)) continue;
+      if (provider.catalogHasPricing) {
+        if (!isZeroCost(model)) continue;
+        if (!(raw?.free === false && probeFailureIsInconclusive(raw.reason, provider.name))) continue;
+      } else if ((verdictFor(`${provider.name}:${model.id}`) || catalogVerdict(provider.name, model.id))?.free !== true) {
+        continue;
+      }
+      discoveredModelIds.push(labeled);
+      adopted.push(labeled);
+    }
+  }
+  if (adopted.length) {
+    log(`adopted ${adopted.length} catalog model(s) already proven free`, adopted);
+  }
+  return adopted;
+}
+
+function catalogLiveProbeIds(provider) {
+  const models = [...provider.catalog.values()].filter(
+    (model) => typeof model.id === 'string' && model.id && isChatModel(model),
+  );
+  const usable = provider.catalogHasPricing
+    ? models.filter(isZeroCost)
+    : models.some(isMarkedFree)
+      ? models.filter(isMarkedFree)
+      : models;
+  return usable
+    .map((model) => model.id)
+    .filter((id) => id.toLowerCase() !== 'all')
+    .sort();
+}
+
+function discoveredIdFor(providerName, modelId) {
+  return `${providerName}:${modelId}`;
+}
+
+function verdictKeysFor(providerName, modelId) {
+  const keys = [`${providerName}:${modelId}`];
+  const slug = normalizeModelSlug(modelId);
+  if (slug && slug !== modelId) keys.push(`${providerName}:${slug}`);
+  return keys;
+}
+
+function modelReachable(modelId, reachable, reachableSlugs) {
+  return reachable.has(modelId) || reachableSlugs.has(normalizeModelSlug(modelId));
+}
+
+async function discoverLiveProvider(provider, configuredRoute) {
+  const providerName = provider.name;
+  const freeIds = catalogLiveProbeIds(provider);
+  const configuredIds = configuredRoute
+    .filter((candidate) => candidate.provider === providerName)
+    .map((candidate) => candidate.model);
+  const configuredSet = new Set(configuredIds);
+  const configuredSlugs = new Set(configuredIds.map(normalizeModelSlug).filter(Boolean));
+  const excluded = new Map();
+  for (const id of freeIds) {
+    if (configuredSet.has(id) || configuredSlugs.has(normalizeModelSlug(id))) continue;
+    const reason =
+      discoveryExclusionReason(id) || discoveryExclusionReason(`${providerName}:${id}`);
+    if (reason) excluded.set(id, reason);
+  }
+  const probeIds = freeIds.filter((id) => !excluded.has(id));
+  let reachable = new Set(probeIds);
+  if (probeIds.length) {
+    log(`probing ${probeIds.length} ${providerName} catalog model(s) for live chat`);
+    const probed = await keepWorkingCatalogModels(probeIds, providerName);
+    if (probed.reached === 0) {
+      log(`${providerName} discovery probe unreachable; keeping previous list`);
+      return { excluded, seen: freeIds, additions: [], removed: [], skipped: true };
+    }
+    reachable = new Set(probed.kept);
+    const inconclusive = probed.failed.filter((item) =>
+      probeFailureIsInconclusive(item.reason, providerName),
+    );
+    const definitive = probed.failed.filter(
+      (item) => !probeFailureIsInconclusive(item.reason, providerName),
+    );
+    if (probed.kept.length === 0 && definitive.length === 0 && probed.reached > 0) {
+      // Every probe was 429/5xx/timeout. That is congestion, not "this id is
+      // paid". Keep (or restore) the catalog's free listings instead of wiping
+      // the provider off the route.
+      log(
+        `${providerName} discovery probes inconclusive; keeping catalog free models`,
+        probed.failed.map((item) => item.id),
+      );
+      reachable = new Set(freeIds.filter((id) => !excluded.has(id)));
+    } else {
+      for (const id of probed.kept) {
+        for (const key of verdictKeysFor(providerName, id)) {
+          setModelVerdict(key, { free: true, reason: 'probe 200 unpaid' });
+        }
+      }
+      for (const item of definitive) {
+        for (const key of verdictKeysFor(providerName, item.id)) {
+          setModelVerdict(key, { free: false, reason: `probe failed: ${item.reason}` });
+        }
+      }
+      if (definitive.length) {
+        log(
+          `dropped ${definitive.length} ${providerName} model(s) that did not serve a free chat`,
+          definitive.map((item) => item.id),
+        );
+      }
+      if (inconclusive.length) {
+        log(
+          `left ${inconclusive.length} ${providerName} model(s) unranked; probe was inconclusive`,
+          inconclusive.map((item) => item.id),
+        );
+      }
+    }
+  }
+
+  const reachableSlugs = new Set([...reachable].map((id) => normalizeModelSlug(id)).filter(Boolean));
+  const fromProvider = (id) => discoveredCandidate(id).provider === providerName;
+  const catalogDiscovered = discoveredModelIds.filter(fromProvider);
+  const allRouted = [...new Set([
+    ...configuredIds.map((id) => discoveredIdFor(providerName, id)),
+    ...catalogDiscovered,
+  ])];
+  const removed = allRouted.filter((id) => {
+    const model = discoveredCandidate(id).model;
+    return !modelReachable(model, reachable, reachableSlugs);
+  });
+  discoveredModelIds = discoveredModelIds.filter((id) => {
+    if (!fromProvider(id)) return true;
+    const model = discoveredCandidate(id).model;
+    return modelReachable(model, reachable, reachableSlugs) && !excluded.has(model);
+  });
+  const knownSlugs = new Set(
+    [
+      ...configuredRoute.map((candidate) => normalizeModelSlug(candidate.model)),
+      ...catalogDiscovered.map((id) => normalizeModelSlug(discoveredCandidate(id).model)),
+    ].filter(Boolean),
+  );
+  const already = new Set([
+    ...configuredIds,
+    ...[...configuredSlugs],
+    ...catalogDiscovered.map((id) => discoveredCandidate(id).model),
+    ...catalogDiscovered.map((id) => normalizeModelSlug(discoveredCandidate(id).model)),
+  ]);
+  const additions = freeIds.filter((id) => {
+    if (!reachable.has(id) || excluded.has(id)) return false;
+    if (already.has(id) || already.has(normalizeModelSlug(id))) return false;
+    // Priced catalogs attach a same-slug copy to an already-ranked model
+    // instead of inserting a duplicate discovery row.
+    if (provider.catalogHasPricing && knownSlugs.has(normalizeModelSlug(id))) return false;
+    return true;
+  });
+  const labeled = additions.map((id) => discoveredIdFor(providerName, id));
+  if (labeled.length) {
+    discoveredModelIds.push(...labeled);
+    log(`discovered ${labeled.length} ${providerName} model(s); evaluating for ${DISCOVERY_ROUTE}`, labeled);
+  } else {
+    log(`free-model discovery complete for ${providerName}: no additions`);
+  }
+  return { excluded, seen: freeIds, additions: labeled, removed, skipped: false };
+}
+
 // For a provider that publishes no prices, the only way to learn whether a
 // model is free is to ask it. One request per candidate, verdict cached
 // forever, so the cost is paid once per model rather than once per run.
@@ -1077,6 +1374,9 @@ async function probeFreeTierCandidates() {
 
   for (const provider of PROVIDERS.values()) {
     if (!provider.probeFreeTier || !registry.hasUsableKey(provider) || !provider.catalog?.size) continue;
+    // OpenAI-compatible unpriced catalogs are live-probed in
+    // performFreeModelDiscovery; this path is for quota-shaped native listings.
+    if (shouldLiveProbeCatalog(provider)) continue;
 
     const known = new Set(
       [
@@ -1095,11 +1395,22 @@ async function probeFreeTierCandidates() {
       // not match character for character. Raw string comparison re-probes
       // models that are already routed and adds a duplicate entry for them.
       if (known.has(normalizeModelSlug(model.id))) continue;
-      // Already answered: no second request until that answer goes stale.
-      if (verdictFor(`${provider.name}:${model.id}`)) continue;
       if (!isChatModel(model)) continue;
       const reason = discoveryExclusionReason(`${provider.name}:${model.id}`);
       if (reason) continue;
+      const existing = catalogVerdict(provider.name, model.id);
+      if (existing) {
+        // A cached free:true used to skip both the probe *and* the route, so
+        // emptying config.json dropped models discovery had already proven.
+        if (existing.free === true) {
+          const key = `${provider.name}:${model.id}`;
+          if (!discoveredModelIds.includes(key)) {
+            discoveredModelIds.push(key);
+            known.add(normalizeModelSlug(model.id));
+          }
+        }
+        continue;
+      }
       candidates.push(model.id);
       budget -= 1;
     }
@@ -1132,79 +1443,48 @@ async function performFreeModelDiscovery(forceCatalogRefresh = false) {
     return;
   }
 
+  const configured = config.routes?.[DISCOVERY_ROUTE];
+  if (!Array.isArray(configured)) {
+    discoveryError = `discovery route does not exist: ${DISCOVERY_ROUTE}`;
+    log(`free-model discovery failed: ${discoveryError}`);
+    discoveryLastCheckedAt = Date.now();
+    saveDiscoveryState();
+    return;
+  }
+  const configuredRoute = configured.map(normalizeCandidate);
+
   try {
-    if (forceCatalogRefresh || !registry.discoveryCatalog()?.catalog.size) {
+    if (forceCatalogRefresh || ![...PROVIDERS.values()].some((provider) => provider.catalog?.size)) {
       await refreshCatalog(true);
-    }
-    const catalogProvider = registry.discoveryCatalog();
-    const catalog = catalogProvider?.catalog || new Map();
-    if (!catalog.size || catalogProvider?.catalogError) {
-      throw new Error(catalogProvider?.catalogError || 'catalog is empty');
-    }
-
-    const configured = config.routes?.[DISCOVERY_ROUTE];
-    if (!Array.isArray(configured)) {
-      throw new Error(`discovery route does not exist: ${DISCOVERY_ROUTE}`);
-    }
-    const configuredCatalogIds = configured
-      .map(normalizeCandidate)
-      .filter((candidate) => candidate.provider === registry.discoveryProvider)
-      .map((candidate) => candidate.model);
-
-    const freeIds = [...catalog.values()]
-      .filter((model) => isZeroCost(model) && isChatModel(model))
-      .map((model) => model.id)
-      .filter((id) => typeof id === 'string' && id)
-      .sort();
-    const eligible = new Set(freeIds);
-    // Configured models are exempt: an explicit config entry beats the filter.
-    const configuredCatalogSet = new Set(configuredCatalogIds);
-    const excluded = new Map();
-    for (const id of freeIds) {
-      if (configuredCatalogSet.has(id)) continue;
-      const reason = discoveryExclusionReason(id);
-      if (reason) excluded.set(id, reason);
-    }
-    discoveryExcludedIds = [...excluded.keys()];
-    if (excluded.size) {
-      log(
-        `excluding ${excluded.size} domain-specific model(s) from ${DISCOVERY_ROUTE}`,
-        [...excluded].map(([id, reason]) => `${id} (${reason})`),
-      );
-    }
-
-    // `eligible` is this one catalog's zero-cost list, so it can only judge
-    // this catalog's models. Entries discovered by probing another provider are
-    // governed by that provider's verdict and must survive this pass untouched.
-    const fromCatalogProvider = (id) =>
-      discoveredCandidate(id).provider === registry.discoveryProvider;
-    const catalogDiscovered = discoveredModelIds.filter(fromCatalogProvider);
-    const allRouted = [...new Set([...configuredCatalogIds, ...catalogDiscovered])];
-    discoveryRemovedIds = allRouted.filter((id) => !eligible.has(id));
-    discoveredModelIds = discoveredModelIds.filter(
-      (id) => !fromCatalogProvider(id) || (eligible.has(id) && !excluded.has(id)),
-    );
-    if (discoveryRemovedIds.length) {
-      log(
-        `removed ${discoveryRemovedIds.length} non-free or unavailable model(s) from active routes`,
-        discoveryRemovedIds,
-      );
-    }
-    const routed = new Set([...configuredCatalogIds, ...catalogDiscovered]);
-    const knownSlugs = new Set(
-      [
-        ...configured.map(normalizeCandidate).map((candidate) => normalizeModelSlug(candidate.model)),
-        ...catalogDiscovered.map((id) => normalizeModelSlug(id)),
-      ].filter(Boolean),
-    );
-    const additions = freeIds.filter(
-      (id) => !routed.has(id) && !knownSlugs.has(normalizeModelSlug(id)) && !excluded.has(id),
-    );
-    if (additions.length) {
-      discoveredModelIds.push(...additions);
-      log(`discovered ${additions.length} free model(s); evaluating for ${DISCOVERY_ROUTE}`, additions);
     } else {
-      log(`free-model discovery complete: no additions for ${DISCOVERY_ROUTE}`);
+      await refreshCatalog(forceCatalogRefresh);
+    }
+    const additions = [];
+    const removed = [];
+    const seen = [];
+    const excluded = [];
+    for (const provider of PROVIDERS.values()) {
+      if (!shouldLiveProbeCatalog(provider)) continue;
+      const result = await discoverLiveProvider(provider, configuredRoute);
+      if (result.skipped) continue;
+      additions.push(...result.additions);
+      removed.push(...result.removed);
+      seen.push(...result.seen);
+      excluded.push(...[...result.excluded.keys()].map((id) => discoveredIdFor(provider.name, id)));
+    }
+    discoveryExcludedIds = [...new Set(excluded)].sort();
+    if (discoveryExcludedIds.length) {
+      log(
+        `excluding ${discoveryExcludedIds.length} domain-specific model(s) from ${DISCOVERY_ROUTE}`,
+        discoveryExcludedIds,
+      );
+    }
+    discoveryRemovedIds = removed;
+    if (removed.length) {
+      log(
+        `removed ${removed.length} non-free or unavailable model(s) from active routes`,
+        removed,
+      );
     }
 
     // A model whose one evaluation attempt failed used to keep score -1 forever,
@@ -1238,15 +1518,14 @@ async function performFreeModelDiscovery(forceCatalogRefresh = false) {
       }
     }
 
-    discoverySeenIds = freeIds;
+    discoverySeenIds = seen;
     discoveryError = '';
   } catch (error) {
     discoveryError = error instanceof Error ? error.message : String(error);
     log(`free-model discovery failed: ${discoveryError}`);
   }
 
-  // Runs regardless of the priced catalog's outcome, since it depends on a
-  // different provider and a failure there says nothing about this.
+  // Google native catalogs still use the quota-shaped evaluate probe.
   if (evaluationEnabled) {
     try {
       await probeFreeTierCandidates();
@@ -1254,6 +1533,8 @@ async function performFreeModelDiscovery(forceCatalogRefresh = false) {
       log(`free-tier probing failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+
+  adoptKnownFreeCatalogModels();
 
   // Timestamped once the whole run is over, so the interval measures complete
   // runs and an observer waiting on it cannot see a half-finished one.
@@ -1267,6 +1548,30 @@ function discoverFreeModels(forceCatalogRefresh = false) {
     discoveryInFlight = null;
   });
   return discoveryInFlight;
+}
+
+async function evaluateUnscoredDiscoveredModels() {
+  if (!evaluationEnabled) return;
+  const pending = discoveredModelIds
+    .filter((id) => {
+      if (discoveryExclusionReason(id)) return false;
+      const evaluation = modelEvaluations[discoveredCandidate(id).model];
+      return evaluation?.status !== 'scored' || evaluation.version !== EVALUATION_VERSION;
+    })
+    .slice(0, EVALUATION_MAX_PER_RUN);
+  if (!pending.length) return;
+  log(`evaluating ${pending.length} unscored discovered model(s)`, pending);
+  for (const id of pending) {
+    const candidate = discoveredCandidate(id);
+    const evaluation = await evaluateModel(candidate);
+    modelEvaluations[candidate.model] = evaluation;
+    if (evaluation.status === 'scored') {
+      log(`evaluated ${id}: score ${evaluation.score}`);
+    } else {
+      log(`evaluation deferred for ${id}: ${evaluation.error}`);
+    }
+    saveDiscoveryState();
+  }
 }
 
 function scheduleNextDiscovery() {
@@ -1802,11 +2107,9 @@ function routeStatus() {
         provider: candidate.provider,
         id: candidate.model,
         pinned,
-        score: pinned
-          ? null
-          : rankedModelScore(key, configuredSet, configuredIndex),
-        baseScore: pinned ? null : baseModelScore(key, configuredSet, configuredIndex),
-        scoreAdjustment: pinned ? 0 : usageAdjustment(key),
+        score: pinned ? null : rankedModelScore(key),
+        baseScore: pinned ? null : baseModelScore(key),
+        scoreAdjustment: 0,
         scoreSource: scoreSourceFor(key, configuredSet),
         // Only meaningful where the catalog publishes prices; elsewhere the
         // freeModels allowlist is the guarantee, so report it as free.
@@ -2069,6 +2372,8 @@ function uiRouteState() {
     provider: entry.provider,
     model: entry.id,
     pinned: entry.pinned,
+    score: entry.score,
+    scoreSource: entry.scoreSource,
     zeroCost: entry.zeroCost,
     cooldownSeconds: entry.cooldownSeconds,
     scoreAdjustment: entry.scoreAdjustment,
@@ -2219,31 +2524,15 @@ async function handleServerConfig(req, res) {
 // ---- Editable configuration (web UI settings tabs) ----
 
 function routeEntryString(entry) {
-  if (typeof entry === 'string') {
-    const model = entry.trim();
-    return model ? `${registry.defaultProvider}:${model}` : '';
-  }
-  if (entry && typeof entry === 'object') {
-    const provider = String(entry.provider || '');
-    const model = String(entry.model || entry.id || '');
-    if (provider && model) return `${provider}:${model}`;
-    return model;
-  }
-  return '';
+  const canonical = canonicalizeRouteEntry(entry, registry.defaultProvider, knownProviderNames());
+  return canonical ? `${canonical.provider}:${canonical.model}` : '';
 }
 
-// "provider:model" -> {provider, model} when the prefix names a provider,
-// otherwise kept as a plain string (e.g. "z-ai/glm-5.2:free").
+// Accepts `{provider, model}`, `provider:model`, or a bare model id that
+// belongs to defaultProvider (including OpenRouter ids that themselves contain
+// a colon, e.g. `z-ai/glm-5.2:free`).
 function parseRouteEntryString(raw) {
-  const text = String(raw || '').trim();
-  if (!text) return null;
-  const separator = text.indexOf(':');
-  if (separator > 0 && PROVIDERS.has(text.slice(0, separator))) {
-    const model = text.slice(separator + 1).trim();
-    if (!model) return null;
-    return { provider: text.slice(0, separator), model };
-  }
-  return text;
+  return canonicalizeRouteEntry(raw, registry.defaultProvider, knownProviderNames());
 }
 
 function editableConfigState() {
@@ -2271,7 +2560,6 @@ function editableConfigState() {
     routes,
     discovery: {
       enabled: discoveryEnabled,
-      provider: registry.discoveryProvider,
       intervalHours: Math.round(DISCOVERY_INTERVAL_MS / 3600000),
       route: DISCOVERY_ROUTE,
       evaluationEnabled,
@@ -2388,7 +2676,9 @@ async function handleProviders(req, res) {
     let purged = 0;
     for (const [routeName, entries] of Object.entries(config.routes || {})) {
       if (!Array.isArray(entries)) continue;
-      const kept = entries.filter((entry) => normalizeCandidate(entry).provider !== name);
+      const kept = entries
+        .map((entry) => normalizeCandidate(entry))
+        .filter((candidate) => candidate.model && candidate.provider !== name);
       if (kept.length === entries.length) continue;
       purged += entries.length - kept.length;
       setOverlayValue(['routes', routeName], kept);
@@ -2491,21 +2781,19 @@ async function handleRoutes(req, res) {
     if (!entry) {
       return sendJson(res, 400, { error: { message: `empty model entry`, type: 'invalid_request_error' } });
     }
-    const key = typeof entry === 'string' ? `:${entry}` : `${entry.provider}:${entry.model}`;
+    const key = `${entry.provider}:${entry.model}`;
     if (seen.has(key)) continue;
     seen.add(key);
     parsed.push(entry);
-    if (typeof entry !== 'string') {
-      const provider = PROVIDERS.get(entry.provider);
-      if (!provider) {
-        return sendJson(res, 400, { error: { message: `unknown provider in entry: ${routeEntryString(entry)}`, type: 'invalid_request_error' } });
-      }
-      if (!provider.catalogHasPricing && !provider.freeModels.has(entry.model)) {
-        provider.freeModels.add(entry.model);
-        const cfg = editableProviderRaw(entry.provider);
-        cfg.freeModels = [...provider.freeModels];
-        notes.push(`added ${entry.model} to ${entry.provider} freeModels`);
-      }
+    const provider = PROVIDERS.get(entry.provider);
+    if (!provider) {
+      return sendJson(res, 400, { error: { message: `unknown provider in entry: ${routeEntryString(entry)}`, type: 'invalid_request_error' } });
+    }
+    if (!provider.catalogHasPricing && !provider.freeModels.has(entry.model)) {
+      provider.freeModels.add(entry.model);
+      const cfg = editableProviderRaw(entry.provider);
+      cfg.freeModels = [...provider.freeModels];
+      notes.push(`added ${entry.model} to ${entry.provider} freeModels`);
     }
   }
   setOverlayValue(['routes', route], parsed);
@@ -2545,8 +2833,8 @@ async function handleLimits(req, res) {
   return sendJson(res, 200, { ok: true, key, limit });
 }
 
-// Discovery + evaluation toggles apply immediately; provider switch applies
-// immediately too; the interval needs a restart (it arms the next timer).
+// Discovery + evaluation toggles apply immediately. The interval needs a
+// restart because it arms the next timer.
 async function handleDiscovery(req, res) {
   let body;
   try {
@@ -2562,15 +2850,6 @@ async function handleDiscovery(req, res) {
   if (body.evaluationEnabled !== undefined) {
     evaluationEnabled = body.evaluationEnabled !== false;
     setOverlayValue(['discovery', 'evaluation', 'enabled'], evaluationEnabled);
-  }
-  if (body.provider !== undefined) {
-    const name = String(body.provider || '');
-    try {
-      registry.setDiscoveryProvider(name);
-    } catch (error) {
-      return sendJson(res, 400, { error: { message: String(error.message || error), type: 'invalid_request_error' } });
-    }
-    setOverlayValue(['discovery', 'provider'], name);
   }
   if (body.intervalHours !== undefined) {
     const hours = Number(body.intervalHours);
@@ -2781,7 +3060,6 @@ async function handler(req, res) {
       providers: registry.health(),
       discovery: {
         enabled: discoveryEnabled,
-        provider: registry.discoveryProvider,
         route: DISCOVERY_ROUTE,
         intervalMs: DISCOVERY_INTERVAL_MS,
         lastCheckedAt: discoveryLastCheckedAt
@@ -2795,9 +3073,9 @@ async function handler(req, res) {
         modelVerdicts,
         // Which providers can contribute new models, and which are only
         // checked for models that disappeared.
-        addsFrom: [...PROVIDERS.values()].filter((p) => p.discover).map((p) => p.name),
+        addsFrom: [...PROVIDERS.values()].filter((p) => p.discover || p.probeFreeTier).map((p) => p.name),
         availabilityOnly: [...PROVIDERS.values()]
-          .filter((p) => p.usesCatalog && !p.catalogHasPricing)
+          .filter((p) => p.usesCatalog && !p.catalogHasPricing && !p.probeFreeTier)
           .map((p) => p.name),
         evaluations: modelEvaluations,
         error: discoveryError || null,
@@ -2816,7 +3094,10 @@ async function handler(req, res) {
       owned_by: 'free-router',
     }));
     const listed = registry.listListedModels();
-    const catalogModels = registry.listCatalogModels(listed.ids).map((model) => ({
+    const catalogModels = registry
+      .listCatalogModels(listed.ids)
+      .filter((model) => verdictFor(`${model.provider}:${model.id}`)?.free !== false)
+      .map((model) => ({
       id: model.id,
       object: model.object,
       created: model.created,
@@ -2862,6 +3143,7 @@ server.listen(PORT, HOST, async () => {
   }
   await refreshCatalog(true);
   await discoverFreeModels();
+  await evaluateUnscoredDiscoveredModels();
   scheduleNextDiscovery();
 });
 

@@ -168,7 +168,7 @@ function formatTable(models, route, health, allModels) {
   const windowDays = usage?.retentionDays || 7;
   lines.push('');
   lines.push(
-    `${pad('#', 3)}  ${pad('status', 14)}  ${pad('today', 8)}  ${pad(`${windowDays}d ok`, 7)}  ${pad('fail', 5)}  ${pad('rank+-', 6)}  ${pad('provider', 12)}  model`,
+    `${pad('#', 3)}  ${pad('status', 14)}  ${pad('today', 8)}  ${pad(`${windowDays}d ok`, 7)}  ${pad('fail', 5)}  ${pad('SWE', 6)}  ${pad('provider', 12)}  model`,
   );
   for (const entry of models) {
     const pin = entry.pinned ? ' *' : '';
@@ -177,11 +177,14 @@ function formatTable(models, route, health, allModels) {
       status = `cooldown ${entry.cooldownSeconds}s`;
     }
     const fails = entry.usage?.window.fail || 0;
-    const shift = entry.scoreAdjustment
-      ? `${entry.scoreAdjustment > 0 ? '+' : ''}${entry.scoreAdjustment}`
-      : '-';
+    const swe =
+      entry.pinned
+        ? '*'
+        : Number.isFinite(entry.score) && entry.score >= 0
+          ? String(entry.score)
+          : '-';
     lines.push(
-      `${pad(entry.priority, 3)}  ${pad(status, 14)}  ${pad(todayCell(entry.usage), 8)}  ${pad(windowCell(entry.usage), 7)}  ${pad(fails || '-', 5)}  ${pad(shift, 6)}  ${pad(entry.provider, 12)}  ${entry.model}${pin}`,
+      `${pad(entry.priority, 3)}  ${pad(status, 14)}  ${pad(todayCell(entry.usage), 8)}  ${pad(windowCell(entry.usage), 7)}  ${pad(fails || '-', 5)}  ${pad(swe, 6)}  ${pad(entry.provider, 12)}  ${entry.model}${pin}`,
     );
   }
   lines.push('');

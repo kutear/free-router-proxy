@@ -33,6 +33,7 @@ cp .env.example .env
 | `OPENROUTER_API_KEY` | [openrouter.ai/keys](https://openrouter.ai/keys) |
 | `TOKENROUTER_API_KEY` | TokenRouter |
 | `BAI_API_KEY` | [chat.b.ai](https://chat.b.ai) |
+| `HASHNEURON_API_KEY` | HashNeuron（`https://hashneuron.space/v1`） |
 
 一个 provider 需要多个 Key？设置 `OPENROUTER_API_KEYS`（或
 `OPENROUTER_API_KEY_KEYS`），逗号分隔填多个值；也可以在 Web UI 里添加

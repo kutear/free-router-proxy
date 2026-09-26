@@ -8,6 +8,22 @@ export function isZeroCost(model) {
   return Number.isFinite(prompt) && Number.isFinite(completion) && prompt === 0 && completion === 0;
 }
 
+function looksFreeId(id) {
+  const lower = String(id || '').toLowerCase();
+  return lower.endsWith(':free') || /(?:^|[/_.-])free(?:$|[/_.-])/.test(lower) || lower.includes('-free');
+}
+
+// Unpriced catalogs cannot use isZeroCost. A free flag, :free suffix, or a
+// "free" tag is the listing saying so; otherwise the caller must live-probe.
+export function isMarkedFree(model) {
+  if (!model) return false;
+  if (model.free === true || model.is_free === true) return true;
+  if (looksFreeId(model.id)) return true;
+  const tags = model.tags;
+  const list = Array.isArray(tags) ? tags : typeof tags === 'string' ? tags.split(',') : [];
+  return list.some((tag) => String(tag).trim().toLowerCase() === 'free');
+}
+
 export function isChatModel(model) {
   // A catalog that states which generation methods a model supports is
   // authoritative; guessing from modalities is only for catalogs that do not.
@@ -182,15 +198,6 @@ export function createProviderRegistry(config, { host, port }) {
     [...providers.values()].find((provider) => provider.catalogHasPricing)?.name ||
     [...providers.keys()][0];
 
-  const configuredDiscovery = config.discovery?.provider;
-  if (configuredDiscovery && !providers.has(configuredDiscovery)) {
-    throw new Error(`discovery.provider "${configuredDiscovery}" is not in providers`);
-  }
-  let discoveryProvider =
-    configuredDiscovery ||
-    [...providers.values()].find((provider) => provider.discover)?.name ||
-    defaultProvider;
-
   function get(name) {
     return providers.get(name);
   }
@@ -207,7 +214,6 @@ export function createProviderRegistry(config, { host, port }) {
   function removeProvider(name) {
     if (!providers.has(name)) return false;
     if (name === defaultProvider) throw new Error(`cannot remove the default provider: ${name}`);
-    if (name === discoveryProvider) throw new Error(`cannot remove the discovery provider: ${name}`);
     providers.delete(name);
     return true;
   }
@@ -215,11 +221,6 @@ export function createProviderRegistry(config, { host, port }) {
   function setDefaultProvider(name) {
     if (!providers.has(name)) throw new Error(`unknown provider: ${name}`);
     defaultProvider = name;
-  }
-
-  function setDiscoveryProvider(name) {
-    if (!providers.has(name)) throw new Error(`unknown provider: ${name}`);
-    discoveryProvider = name;
   }
 
   function headers(name, keyOverride) {
@@ -567,7 +568,8 @@ export function createProviderRegistry(config, { host, port }) {
   }
 
   function discoveryCatalog() {
-    return get(discoveryProvider);
+    if (get(defaultProvider)?.usesCatalog) return get(defaultProvider);
+    return [...providers.values()].find((provider) => provider.usesCatalog) || null;
   }
 
   // Applied to the live provider and to process.env, so a key set at runtime
@@ -624,9 +626,6 @@ export function createProviderRegistry(config, { host, port }) {
     get defaultProvider() {
       return defaultProvider;
     },
-    get discoveryProvider() {
-      return discoveryProvider;
-    },
     get,
     headers,
     metadata,
@@ -647,7 +646,6 @@ export function createProviderRegistry(config, { host, port }) {
     addProvider,
     removeProvider,
     setDefaultProvider,
-    setDiscoveryProvider,
     keySlots,
     rotateKeyCursor,
     markKeyInvalid,

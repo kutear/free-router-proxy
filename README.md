@@ -33,6 +33,7 @@ local-only interface follows your browser language (12 languages included).
 | `OPENROUTER_API_KEY` | [openrouter.ai/keys](https://openrouter.ai/keys) |
 | `TOKENROUTER_API_KEY` | TokenRouter |
 | `BAI_API_KEY` | [chat.b.ai](https://chat.b.ai) |
+| `HASHNEURON_API_KEY` | HashNeuron (`https://hashneuron.space/v1`) |
 
 Need more than one key per provider? Set `OPENROUTER_API_KEYS` (or
 `OPENROUTER_API_KEY_KEYS`) with comma-separated values, or add named keys in
