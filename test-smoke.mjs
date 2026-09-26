@@ -32,6 +32,13 @@ import {
   rememberSignaturesFromPayload,
 } from './thought-signature.mjs';
 import { displayPath, maskSecret, validateSecret } from './ui.mjs';
+import {
+  getUiPassword,
+  isLoopbackAddress,
+  isUiAuthenticated,
+  safeCompare,
+  uiGuardFailure,
+} from './auth.mjs';
 import { loadSweBenchScores, sweBenchScoreFor } from './swe-bench.mjs';
 import {
   addMissingKeys,
@@ -71,6 +78,133 @@ assert.equal(normalizeModelSlug('acme/extra-1:free'), 'extra-1');
   assert.equal(sweBenchScoreFor(scores, 'google/gemma-4-31b-it:free'), 52.0);
   assert.equal(sweBenchScoreFor(scores, 'hy3'), null);
   assert.equal(sweBenchScoreFor(scores, 'gemma-4-26b-a4b-it'), null);
+}
+ 
+{
+  assert.equal(isLoopbackAddress('127.0.0.1'), true);
+  assert.equal(isLoopbackAddress('127.0.0.2'), true);
+  assert.equal(isLoopbackAddress('::1'), true);
+  assert.equal(isLoopbackAddress('::ffff:127.0.0.1'), true);
+  assert.equal(isLoopbackAddress('192.168.1.1'), false);
+  assert.equal(isLoopbackAddress('10.0.0.1'), false);
+  assert.equal(isLoopbackAddress(''), false);
+  assert.equal(isLoopbackAddress(null), false);
+
+  assert.equal(safeCompare('secret', 'secret'), true);
+  assert.equal(safeCompare('secret', 'wrong'), false);
+  assert.equal(safeCompare('secret', 'secret2'), false);
+
+  assert.equal(getUiPassword({ FREE_ROUTER_PASSWORD: 'p1' }, {}), 'p1');
+  assert.equal(getUiPassword({ WEBUI_PASSWORD: 'p2' }, {}), 'p2');
+  assert.equal(getUiPassword({ FREE_ROUTER_PASSWORD: 'p1', WEBUI_PASSWORD: 'p2' }, {}), 'p1');
+  assert.equal(getUiPassword({}, { password: 'p3' }), 'p3');
+  assert.equal(getUiPassword({}, {}), '');
+
+  const secret = 'test-secret-123';
+  // Basic Auth with username:password
+  assert.equal(
+    isUiAuthenticated(
+      { headers: { authorization: `Basic ${Buffer.from(`admin:${secret}`).toString('base64')}` } },
+      secret,
+    ),
+    true,
+  );
+  // Basic Auth with :password
+  assert.equal(
+    isUiAuthenticated(
+      { headers: { authorization: `Basic ${Buffer.from(`:${secret}`).toString('base64')}` } },
+      secret,
+    ),
+    true,
+  );
+  // Basic Auth with password:
+  assert.equal(
+    isUiAuthenticated(
+      { headers: { authorization: `Basic ${Buffer.from(`${secret}:`).toString('base64')}` } },
+      secret,
+    ),
+    true,
+  );
+  // Basic Auth with password only
+  assert.equal(
+    isUiAuthenticated(
+      { headers: { authorization: `Basic ${Buffer.from(secret).toString('base64')}` } },
+      secret,
+    ),
+    true,
+  );
+  // Basic Auth with wrong password
+  assert.equal(
+    isUiAuthenticated(
+      { headers: { authorization: `Basic ${Buffer.from('admin:wrong').toString('base64')}` } },
+      secret,
+    ),
+    false,
+  );
+  // Bearer token
+  assert.equal(
+    isUiAuthenticated({ headers: { authorization: `Bearer ${secret}` } }, secret),
+    true,
+  );
+  assert.equal(
+    isUiAuthenticated({ headers: { authorization: 'Bearer wrong' } }, secret),
+    false,
+  );
+  // Custom headers
+  assert.equal(isUiAuthenticated({ headers: { 'x-password': secret } }, secret), true);
+  assert.equal(isUiAuthenticated({ headers: { 'x-webui-password': secret } }, secret), true);
+  assert.equal(isUiAuthenticated({ headers: { 'x-free-router-password': secret } }, secret), true);
+  assert.equal(isUiAuthenticated({ headers: { 'x-api-key': secret } }, secret), true);
+  // Cookies
+  assert.equal(isUiAuthenticated({ headers: { cookie: `free_router_password=${secret}` } }, secret), true);
+  assert.equal(isUiAuthenticated({ headers: { cookie: `webui_password=${secret}` } }, secret), true);
+  assert.equal(isUiAuthenticated({ headers: { cookie: `foo=bar; password=${secret}` } }, secret), true);
+  // No credentials
+  assert.equal(isUiAuthenticated({ headers: {} }, secret), false);
+
+  // uiGuardFailure when allowExternal = false (no password configured)
+  assert.match(
+    uiGuardFailure({ socket: { remoteAddress: '192.168.1.1' } }, { allowExternal: false }),
+    /must come from loopback/,
+  );
+  assert.match(
+    uiGuardFailure(
+      { socket: { remoteAddress: '127.0.0.1' }, headers: { host: 'frp.kutear.com' } },
+      { allowExternal: false },
+    ),
+    /unexpected Host header/,
+  );
+  assert.match(
+    uiGuardFailure(
+      { socket: { remoteAddress: '127.0.0.1' }, headers: { host: 'localhost', origin: 'https://frp.kutear.com' } },
+      { allowExternal: false },
+    ),
+    /unexpected Origin header/,
+  );
+  assert.equal(
+    uiGuardFailure(
+      { socket: { remoteAddress: '127.0.0.1' }, headers: { host: 'localhost' } },
+      { allowExternal: false },
+    ),
+    '',
+  );
+
+  // uiGuardFailure when allowExternal = true (authenticated with password)
+  assert.equal(
+    uiGuardFailure(
+      { socket: { remoteAddress: '192.168.1.1' }, headers: { host: 'frp.kutear.com', origin: 'https://frp.kutear.com' } },
+      { allowExternal: true },
+    ),
+    '',
+  );
+  // CSRF protection still works even with allowExternal
+  assert.match(
+    uiGuardFailure(
+      { socket: { remoteAddress: '192.168.1.1' }, headers: { host: 'frp.kutear.com', 'sec-fetch-site': 'cross-site' } },
+      { allowExternal: true },
+    ),
+    /cross-site request blocked/,
+  );
 }
 
 {
@@ -1889,6 +2023,26 @@ try {
     request.end();
   });
   assert.equal(rebind, 403);
+  const unauthedProxyHost = await new Promise((resolve, reject) => {
+    const request = http.request(
+      {
+        host: '127.0.0.1',
+        port: routerPort,
+        path: '/',
+        method: 'GET',
+        headers: { Host: 'frp.kutear.com' },
+      },
+      (response) => {
+        let body = '';
+        response.on('data', (c) => { body += c; });
+        response.on('end', () => resolve({ status: response.statusCode, body: JSON.parse(body) }));
+      },
+    );
+    request.on('error', reject);
+    request.end();
+  });
+  assert.equal(unauthedProxyHost.status, 403);
+  assert.match(unauthedProxyHost.body.error.message, /unexpected Host header: frp.kutear.com/);
   const badOrigin = await fetch(`${base}/api/keys`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Origin: 'https://evil.example.com' },
@@ -2269,3 +2423,165 @@ try {
     fs.rmSync(adoptDir, { recursive: true, force: true, maxRetries: 3 });
   }
 }
+
+{
+  const authTestDir = fs.mkdtempSync(path.join(os.tmpdir(), 'free-router-auth-'));
+  const portHolder = http.createServer();
+  await listen(portHolder);
+  const authRouterPort = portHolder.address().port;
+  await close(portHolder);
+
+  const authConfig = path.join(authTestDir, 'config.json');
+  fs.writeFileSync(
+    authConfig,
+    JSON.stringify({
+      host: '127.0.0.1',
+      port: authRouterPort,
+      webui: { enabled: true },
+      defaultProvider: 'openrouter',
+      providers: {
+        openrouter: {
+          baseUrl: 'http://127.0.0.1:1/api/v1',
+          keyEnv: 'OPENROUTER_API_KEY',
+          freeModels: [],
+        },
+      },
+      discovery: { enabled: false },
+      routes: {},
+    }),
+  );
+
+  const testPassword = 'ui-secret-password-123';
+  const authChild = spawn(process.execPath, [path.join(HERE, 'server.mjs')], {
+    env: {
+      ...process.env,
+      FREE_ROUTER_PASSWORD: testPassword,
+      FREE_ROUTER_CONFIG: authConfig,
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  let authOut = '';
+  authChild.stdout.on('data', (chunk) => {
+    authOut += chunk;
+  });
+  authChild.stderr.on('data', (chunk) => {
+    authOut += chunk;
+  });
+
+  try {
+    let started = false;
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      try {
+        const res = await fetch(`http://127.0.0.1:${authRouterPort}/health`);
+        if (res.ok) {
+          started = true;
+          break;
+        }
+      } catch {
+        // Still starting.
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.ok(started, `auth test router did not start\n${authOut}`);
+
+    const base = `http://127.0.0.1:${authRouterPort}`;
+
+    // 1. Without credentials, GET / returns 401 with WWW-Authenticate header
+    const unauthedRoot = await fetch(`${base}/`);
+    assert.equal(unauthedRoot.status, 401);
+    assert.equal(unauthedRoot.headers.get('www-authenticate'), 'Basic realm="Free Router"');
+    const unauthedBody = await unauthedRoot.json();
+    assert.equal(unauthedBody.error?.type, 'unauthorized');
+
+    // 2. Without credentials, GET /api/state returns 401
+    const unauthedApi = await fetch(`${base}/api/state`);
+    assert.equal(unauthedApi.status, 401);
+
+    // 3. With invalid password, returns 401
+    const badAuth = await fetch(`${base}/`, {
+      headers: {
+        Authorization: `Basic ${Buffer.from('admin:wrong-pass').toString('base64')}`,
+      },
+    });
+    assert.equal(badAuth.status, 401);
+
+    // 4. With correct Basic Auth credentials, returns 200 and serves HTML
+    const authedRoot = await fetch(`${base}/`, {
+      headers: {
+        Authorization: `Basic ${Buffer.from(`admin:${testPassword}`).toString('base64')}`,
+      },
+    });
+    assert.equal(authedRoot.status, 200);
+    assert.match(authedRoot.headers.get('content-type'), /text\/html/);
+
+    // 5. With Bearer token, returns 200
+    const bearerApi = await fetch(`${base}/api/state`, {
+      headers: {
+        Authorization: `Bearer ${testPassword}`,
+      },
+    });
+    assert.equal(bearerApi.status, 200);
+
+    // 6. With custom header X-Password, returns 200
+    const headerApi = await fetch(`${base}/api/state`, {
+      headers: {
+        'X-Password': testPassword,
+      },
+    });
+    assert.equal(headerApi.status, 200);
+
+    // 7. With Cookie, returns 200
+    const cookieApi = await fetch(`${base}/api/state`, {
+      headers: {
+        Cookie: `free_router_password=${testPassword}`,
+      },
+    });
+    assert.equal(cookieApi.status, 200);
+
+    // 8. Reverse proxy / external domain Host header is allowed when authenticated
+    const authedProxyReq = await new Promise((resolve, reject) => {
+      const request = http.request(
+        {
+          host: '127.0.0.1',
+          port: authRouterPort,
+          path: '/',
+          method: 'GET',
+          headers: {
+            Host: 'frp.kutear.com',
+            Authorization: `Basic ${Buffer.from(`admin:${testPassword}`).toString('base64')}`,
+          },
+        },
+        (response) => {
+          response.resume();
+          response.on('end', () => resolve({ status: response.statusCode, headers: response.headers }));
+        },
+      );
+      request.on('error', reject);
+      request.end();
+    });
+    assert.equal(authedProxyReq.status, 200);
+    assert.match(authedProxyReq.headers['content-type'], /text\/html/);
+
+    // 9. API / Model endpoints (/health, /v1/models) are not affected by webui password
+    const healthRes = await fetch(`${base}/health`);
+    assert.equal(healthRes.status, 200);
+    const modelsRes = await fetch(`${base}/v1/models`);
+    assert.equal(modelsRes.status, 200);
+  } finally {
+    authChild.kill('SIGTERM');
+    await new Promise((resolve) => {
+      if (authChild.exitCode !== null || authChild.signalCode !== null) return resolve();
+      const timer = setTimeout(() => {
+        authChild.kill('SIGKILL');
+        resolve();
+      }, 3000);
+      authChild.once('exit', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    fs.rmSync(authTestDir, { recursive: true, force: true, maxRetries: 3 });
+  }
+}
+
