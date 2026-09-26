@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node server.mjs",
     "models": "node list-models.mjs",
-    "check": "node --check config.mjs && node --check i18n.mjs && node --check providers.mjs && node --check proxy.mjs && node --check quota.mjs && node --check redact.mjs && node --check thought-signature.mjs && node --check server.mjs && node --check ui.mjs && node --check list-models.mjs && node --check test-smoke.mjs",
+    "check": "node --check auth.mjs && node --check config.mjs && node --check i18n.mjs && node --check providers.mjs && node --check proxy.mjs && node --check quota.mjs && node --check redact.mjs && node --check thought-signature.mjs && node --check server.mjs && node --check ui.mjs && node --check list-models.mjs && node --check test-smoke.mjs",
     "test": "node test-smoke.mjs"
   },
   "engines": {

@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { getUiPassword, isUiAuthenticated, uiGuardFailure } from './auth.mjs';
 import {
   buildLiveConfig,
   canonicalizeRouteEntry,
@@ -2285,42 +2286,7 @@ async function handleChat(req, res) {
   }
 }
 
-function isLoopbackAddress(address) {
-  const plain = String(address || '').replace(/^::ffff:/, '');
-  return plain === '::1' || plain === '127.0.0.1' || plain.startsWith('127.');
-}
-
-// The management interface has no login because it is local-only. Require a
-// loopback peer and loopback Host/Origin, and reject cross-site browser calls.
-// A plain curl call sends neither Origin nor Sec-Fetch-Site and is allowed.
-function uiGuardFailure(req) {
-  if (!isLoopbackAddress(req.socket?.remoteAddress)) return 'requests must come from loopback';
-
-  const host = String(req.headers.host || '');
-  const hostname = host.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
-  if (hostname && hostname !== 'localhost' && !isLoopbackAddress(hostname)) {
-    return `unexpected Host header: ${host}`;
-  }
-
-  const site = String(req.headers['sec-fetch-site'] || '');
-  if (site && site !== 'same-origin' && site !== 'none') {
-    return `cross-site request blocked (Sec-Fetch-Site: ${site})`;
-  }
-
-  const origin = String(req.headers.origin || '');
-  if (origin) {
-    let originHost = '';
-    try {
-      originHost = new URL(origin).hostname;
-    } catch {
-      return `invalid Origin header: ${origin}`;
-    }
-    if (originHost !== 'localhost' && !isLoopbackAddress(originHost)) {
-      return `unexpected Origin header: ${origin}`;
-    }
-  }
-  return '';
-}
+// Web UI authentication and access guard helpers live in auth.mjs.
 
 function uiProviderState() {
   const catalogHealth = registry.health();
@@ -2975,10 +2941,27 @@ async function handler(req, res) {
         error: { message: 'web interface is disabled', type: 'not_found' },
       });
     }
-    const failure = uiGuardFailure(req);
-    if (failure) {
-      log(`blocked web interface request: ${failure}`);
-      return sendJson(res, 403, { error: { message: failure, type: 'forbidden' } });
+    const uiPassword = getUiPassword(process.env, uiConfig);
+    if (uiPassword) {
+      if (!isUiAuthenticated(req, uiPassword)) {
+        return sendJson(
+          res,
+          401,
+          { error: { message: 'unauthorized', type: 'unauthorized' } },
+          { 'WWW-Authenticate': 'Basic realm="Free Router"' },
+        );
+      }
+      const failure = uiGuardFailure(req, { allowExternal: true });
+      if (failure) {
+        log(`blocked web interface request: ${failure}`);
+        return sendJson(res, 403, { error: { message: failure, type: 'forbidden' } });
+      }
+    } else {
+      const failure = uiGuardFailure(req, { allowExternal: false });
+      if (failure) {
+        log(`blocked web interface request: ${failure}`);
+        return sendJson(res, 403, { error: { message: failure, type: 'forbidden' } });
+      }
     }
   }
 
@@ -3136,7 +3119,10 @@ server.keepAliveTimeout = 5000;
 
 server.listen(PORT, HOST, async () => {
   log(`Free Router ${VERSION} listening on http://${HOST}:${PORT}/v1 (config: ${displayPath(CONFIG_PATH)}, ${CONFIG_FORMAT})`);
-  if (UI_ENABLED) log(`web interface on http://${HOST}:${PORT}/`);
+  if (UI_ENABLED) {
+    const hasPassword = Boolean(getUiPassword(process.env, uiConfig));
+    log(`web interface on http://${HOST}:${PORT}/ (authentication: ${hasPassword ? 'password required' : 'loopback-only'})`);
+  }
   for (const provider of PROVIDERS.values()) {
     if (!registry.hasUsableKey(provider)) log(`warning: ${provider.keyEnv} is missing`);
     else if (provider.apiKeys.length > 1) log(`${provider.name}: ${provider.apiKeys.length} keys configured`);
